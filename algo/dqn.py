@@ -6,6 +6,8 @@ import random
 from collections import deque
 import os
 
+from .base import ActionAdapter, ActionResult, BaseAgent, Transition
+
 
 class QNetwork(nn.Module):
     def __init__(self, state_size, action_size, hidden_size):
@@ -42,23 +44,19 @@ class ReplayBuffer:
         """
         self.buffer = deque(maxlen=capacity)
 
-    def add(self, state, action, reward, next_state, done):
+    def add(self, transition):
         """
         Add an experience to the buffer.
 
-        :param state: Current state
-        :param action: Executed action
-        :param reward: Received reward
-        :param next_state: Next state
-        :param done: Whether the episode is done
+        :param transition: Transition object
         """
         self.buffer.append(
             (
-                state.detach().clone(),
-                action.detach().clone(),
-                reward.detach().clone(),
-                next_state.detach().clone(),
-                done,
+                transition.obs.detach().clone(),
+                transition.action.detach().clone(),
+                transition.reward.detach().clone(),
+                transition.next_obs.detach().clone(),
+                transition.done,
             )
         )
 
@@ -75,7 +73,9 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-class DQNAgent:
+class DQNAgent(BaseAgent):
+    algo_name = "dqn"
+
     def __init__(
         self,
         state_size,
@@ -89,6 +89,10 @@ class DQNAgent:
         learning_rate=1e-3,
         tau=1e-3,
         update_every=4,
+        eps_start=1.0,
+        eps_end=0.01,
+        eps_decay=0.995,
+        action_type="discrete",
     ):
         """
         Initialize the DQN agent.
@@ -114,6 +118,10 @@ class DQNAgent:
         self.tau = tau
         self.update_every = update_every
         self.learning_step = 0
+        self.epsilon = eps_start
+        self.eps_end = eps_end
+        self.eps_decay = eps_decay
+        self.action_adapter = ActionAdapter(action_type, max_order)
 
         self.q_network = QNetwork(state_size, action_size, hidden_size)
         self.target_network = QNetwork(state_size, action_size, hidden_size)
@@ -123,30 +131,34 @@ class DQNAgent:
         self.loss = nn.MSELoss()
         self.memory = ReplayBuffer(buffer_size)
         self.t_step = 0
+        self.pending_updates = 0
 
-    def step(self, state, action, reward, next_state, done):
+    def observe(self, transition):
         """
-        Add an experience to the replay buffer and learn when scheduled.
+        Add an experience to the replay buffer and schedule learning when ready.
 
-        :param state: Current state
-        :param action: Executed action
-        :param reward: Received reward
-        :param next_state: Next state
-        :param done: Whether the episode is done
+        :param transition: Transition object
         """
-        self.memory.add(state, action, reward, next_state, done)
+        self.memory.add(transition)
 
         self.t_step = (self.t_step + 1) % self.update_every
         if self.t_step == 0 and len(self.memory) > self.batch_size:
-            experiences = self.memory.sample(self.batch_size)
-            self.learn(experiences)
+            self.pending_updates += 1
 
-    def act(self, state, epsilon=0.0):
+    def step(self, state, action, reward, next_state, done):
+        """
+        Backward-compatible wrapper for the old DQN-specific training loop.
+        """
+        self.observe(Transition(state, action, reward, next_state, done))
+        if self.ready_to_update():
+            self.update()
+
+    def act(self, state, mode="train"):
         """
         Choose an action from the current state.
 
         :param state: Current state
-        :param epsilon: Epsilon-greedy policy parameter
+        :param mode: "train" enables epsilon-greedy exploration, "eval" is greedy
         :return: Selected action
         """
         state = torch.as_tensor(state, dtype=torch.float32).flatten()
@@ -156,10 +168,28 @@ class DQNAgent:
             action_values = self.q_network(state.unsqueeze(0))
         self.q_network.train()
 
+        epsilon = self.epsilon if mode == "train" else 0.0
         if random.random() > epsilon:
-            return torch.argmax(action_values).item() + 1
+            raw_action = torch.argmax(action_values).reshape(())
         else:
-            return random.randint(1, self.max_order)
+            raw_action = torch.randint(0, self.max_order, ()).reshape(())
+
+        env_action = self.action_adapter.to_env_action(raw_action)
+        return ActionResult(env_action=env_action, raw_action=raw_action)
+
+    def ready_to_update(self):
+        return self.pending_updates > 0
+
+    def update(self):
+        if not self.ready_to_update():
+            return {}
+        self.pending_updates -= 1
+        experiences = self.memory.sample(self.batch_size)
+        loss = self.learn(experiences)
+        return {"loss": loss, "epsilon": self.epsilon}
+
+    def on_episode_end(self):
+        self.epsilon = max(self.eps_end, self.eps_decay * self.epsilon)
 
     def learn(self, experiences):
         """
@@ -174,8 +204,7 @@ class DQNAgent:
         next_states = torch.stack(next_states).float()
         dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(1)
 
-        Q_targets_next = torch.max(self.target_network(next_states), 1)[0].unsqueeze(1)
-        Q_targets = rewards + (self.gamma * Q_targets_next * (1 - dones))
+        Q_targets = self._compute_q_targets(rewards, next_states, dones)
         Q_expected = torch.gather(self.q_network(states), 1, actions)
         loss = self.loss(Q_expected, Q_targets)
         self.optimizer.zero_grad()
@@ -191,13 +220,19 @@ class DQNAgent:
 
         return loss.item()
 
+    def _compute_q_targets(self, rewards, next_states, dones):
+        Q_targets_next = torch.max(self.target_network(next_states), 1)[0].unsqueeze(1)
+        return rewards + (self.gamma * Q_targets_next * (1 - dones))
+
     def save(self, filename):
         """
         Save model parameters.
 
         :param filename: File name
         """
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        directory = os.path.dirname(filename)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         torch.save(
             {
                 "q_network_state_dict": self.q_network.state_dict(),
@@ -222,3 +257,12 @@ class DQNAgent:
             print(f"Loaded model from {filename}")
             return True
         return False
+
+
+class DoubleDQNAgent(DQNAgent):
+    algo_name = "double_dqn"
+
+    def _compute_q_targets(self, rewards, next_states, dones):
+        best_actions = torch.argmax(self.q_network(next_states), dim=1, keepdim=True)
+        next_q_values = self.target_network(next_states).gather(1, best_actions)
+        return rewards + (self.gamma * next_q_values * (1 - dones))
