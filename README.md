@@ -1,17 +1,16 @@
 # Project for 2026Spring Multiagent Course
 
-## Algorithm selection
+## Configuration
 
-Training is configured from `CONFIG` in `main.py`. Change the `algo` field to switch
-between registered algorithms:
+Training is configured with Hydra. The base config lives at `cfg/base.yaml`, and
+algorithm configs live under `cfg/algo`.
 
-```python
-CONFIG = {
-    "algo": "dqn",  # dqn | double_dqn | ppo | trpo | sac
-    ...
-}
+```bash
+python main.py algo=ppo exp=my_run
 ```
 
-`dqn` and `double_dqn` are implemented. `ppo`, `trpo`, and `sac` are registered with
+`dqn`, `double_dqn`, and `ppo` are implemented. `trpo` and `sac` are registered with
 explicit placeholders so future implementations can plug into the same `BaseAgent`
 API without changing `train()` or `test()`.
+
+Models are saved to `models/{algo}/{exp}` and figures to `figures/{algo}/{exp}`.

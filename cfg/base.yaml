@@ -1,0 +1,52 @@
+defaults:
+  - algo: double_dqn
+  - _self_
+
+exp: debug
+
+env:
+  num_firms: 10
+  p: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+  h: 0.5
+  c: 2
+  initial_inventory: 100
+  poisson_lambda: 10
+  max_steps: 100
+  max_order: 20
+
+train:
+  num_episodes: 2000
+  checkpoint_every: 500
+  log_every: 100
+
+test:
+  num_episodes: 10
+
+opponents:
+  policy: random
+  constant_order: 10
+
+output:
+  model_root: models
+  figure_root: figures
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: "[%(asctime)s][%(name)s][%(levelname)s] - %(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers: [console]
+    disable_existing_loggers: false

@@ -1,56 +1,14 @@
 import os
-
-# os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
-
+from pathlib import Path
+import hydra
 import matplotlib.pyplot as plt
 import torch
+from hydra.utils import to_absolute_path
+from omegaconf import OmegaConf
 
 from algo import build_agent
 from algo.base import Transition
 from env import Env
-
-CONFIG = {
-    "algo": "dqn",
-    "env": {
-        "num_firms": 10,
-        "p": [11 - i for i in range(10)],
-        "h": 0.5,
-        "c": 2,
-        "initial_inventory": 100,
-        "poisson_lambda": 10,
-        "max_steps": 100,
-        "max_order": 20,
-    },
-    "agent": {
-        "firm_id": 5,
-        "state_size": 3,
-        "action_size": 20,
-        "hidden_size": 64,
-        "buffer_size": 10000,
-        "batch_size": 64,
-        "gamma": 0.99,
-        "learning_rate": 1e-3,
-        "tau": 1e-3,
-        "update_every": 4,
-        "eps_start": 1.0,
-        "eps_end": 0.01,
-        "eps_decay": 0.995,
-        "action_type": "discrete",
-    },
-    "train": {
-        "num_episodes": 2000,
-        "checkpoint_every": 500,
-        "log_every": 100,
-        "model_dir": "models",
-    },
-    "test": {
-        "num_episodes": 10,
-    },
-    "opponents": {
-        "policy": "random",
-        "constant_order": 10,
-    },
-}
 
 
 class RandomOrderPolicy:
@@ -82,7 +40,7 @@ def build_env(config):
     env_config = config["env"]
     return Env(
         env_config["num_firms"],
-        env_config["p"],
+        list(env_config["p"]),
         env_config["h"],
         env_config["c"],
         env_config["initial_inventory"],
@@ -93,11 +51,24 @@ def build_env(config):
 
 def build_configured_agent(config):
     env_config = config["env"]
+    algo_config = config["algo"]
     agent_config = {
-        **config["agent"],
+        **OmegaConf.to_container(algo_config["agent"], resolve=True),
         "max_order": env_config["max_order"],
     }
-    return build_agent(config["algo"], **agent_config)
+    return build_agent(algo_config["name"], **agent_config)
+
+
+def build_output_dirs(config):
+    algo_name = config["algo"]["name"]
+    exp = str(config.get("exp", "debug"))
+    model_root = config["output"].get("model_root", "models")
+    figure_root = config["output"].get("figure_root", "figures")
+    model_dir = Path(to_absolute_path(os.path.join(model_root, algo_name, exp)))
+    figure_dir = Path(to_absolute_path(os.path.join(figure_root, algo_name, exp)))
+    model_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    return model_dir, figure_dir
 
 
 def collect_actions(env, agent, opponent_policy, state, mode):
@@ -114,7 +85,7 @@ def collect_actions(env, agent, opponent_policy, state, mode):
     return actions, action_result
 
 
-def train(env, agent, opponent_policy, train_config):
+def train(env, agent, opponent_policy, train_config, model_dir):
     """
     Train any agent that implements the BaseAgent API.
     """
@@ -123,7 +94,6 @@ def train(env, agent, opponent_policy, train_config):
     max_t = train_config.get("max_t", env.max_steps)
     log_every = train_config.get("log_every", 100)
     checkpoint_every = train_config.get("checkpoint_every", 500)
-    model_dir = train_config.get("model_dir", "models")
     os.makedirs(model_dir, exist_ok=True)
 
     for i_episode in range(1, num_episodes + 1):
@@ -165,6 +135,8 @@ def train(env, agent, opponent_policy, train_config):
                 break
 
         agent.on_episode_end()
+        while agent.ready_to_update():
+            last_update_metrics = agent.update()
         scores.append(score.detach().clone())
 
         if i_episode % log_every == 0:
@@ -252,7 +224,7 @@ def test(env, agent, opponent_policy, num_episodes=10):
     )
 
 
-def plot_training_results(scores, algo_name, window_size=100):
+def plot_training_results(scores, algo_name, figure_dir, window_size=100):
     """
     Plot training rewards.
     """
@@ -284,12 +256,17 @@ def plot_training_results(scores, algo_name, window_size=100):
     plt.xlabel("Episode")
     plt.ylabel("Reward")
     plt.legend()
-    plt.savefig("figures/training_rewards.png")
+    plt.savefig(os.path.join(figure_dir, "training_rewards.png"))
     plt.close()
 
 
 def plot_test_results(
-    scores, inventory_history, orders_history, demand_history, satisfied_demand_history
+    scores,
+    inventory_history,
+    orders_history,
+    demand_history,
+    satisfied_demand_history,
+    figure_dir,
 ):
     """
     Plot test results.
@@ -341,22 +318,21 @@ def plot_test_results(
     axs[1, 1].set_ylabel("Total Reward")
 
     plt.tight_layout()
-    plt.savefig("figures/test_results.png")
+    plt.savefig(os.path.join(figure_dir, "test_results.png"))
     plt.close()
 
 
-if __name__ == "__main__":
-    os.makedirs("models", exist_ok=True)
-    os.makedirs("figures", exist_ok=True)
+@hydra.main(config_path="cfg", config_name="base", version_base=None)
+def main(config):
+    model_dir, figure_dir = build_output_dirs(config)
+    env = build_env(config)
+    agent = build_configured_agent(config)
+    opponent_policy = build_opponent_policy(config)
 
-    env = build_env(CONFIG)
-    agent = build_configured_agent(CONFIG)
-    opponent_policy = build_opponent_policy(CONFIG)
-
-    scores = train(env, agent, opponent_policy, CONFIG["train"])
+    scores = train(env, agent, opponent_policy, config["train"], model_dir)
 
     plt.rcParams["axes.unicode_minus"] = False
-    plot_training_results(scores, CONFIG["algo"])
+    plot_training_results(scores, config["algo"]["name"], figure_dir)
 
     (
         test_scores,
@@ -364,7 +340,12 @@ if __name__ == "__main__":
         orders_history,
         demand_history,
         satisfied_demand_history,
-    ) = test(env, agent, opponent_policy, num_episodes=CONFIG["test"]["num_episodes"])
+    ) = test(
+        env,
+        agent,
+        opponent_policy,
+        num_episodes=config["test"]["num_episodes"],
+    )
 
     plot_test_results(
         test_scores,
@@ -372,4 +353,9 @@ if __name__ == "__main__":
         orders_history,
         demand_history,
         satisfied_demand_history,
+        figure_dir,
     )
+
+
+if __name__ == "__main__":
+    main()

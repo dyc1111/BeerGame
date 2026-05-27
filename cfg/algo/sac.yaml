@@ -1,0 +1,9 @@
+name: sac
+
+agent:
+  firm_id: 5
+  state_size: 3
+  action_size: 20
+  hidden_size: 64
+  gamma: 0.99
+  action_type: continuous
