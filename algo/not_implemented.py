@@ -16,9 +16,5 @@ class AlgorithmNotImplementedAgent(BaseAgent):
         )
 
 
-class TRPOAgent(AlgorithmNotImplementedAgent):
-    algo_name = "trpo"
-
-
 class SACAgent(AlgorithmNotImplementedAgent):
     algo_name = "sac"

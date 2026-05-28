@@ -40,6 +40,38 @@ class QNetwork(nn.Module):
         return self.fc3(x)
 
 
+class DuelingQNetwork(nn.Module):
+    def __init__(self, state_size: int, action_size: int, hidden_size: int) -> None:
+        """
+        Initialize a dueling Q-network with separate value and advantage streams.
+
+        :param state_size: State-space dimension
+        :param action_size: Action-space dimension
+        :param hidden_size: Hidden dimension
+        """
+        super().__init__()
+        self.feature = nn.Sequential(
+            nn.Linear(state_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+        )
+        self.value_stream = nn.Linear(hidden_size, 1)
+        self.advantage_stream = nn.Linear(hidden_size, action_size)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        :param state: Input state
+        :return: Q-values for each action
+        """
+        features = self.feature(state)
+        value = self.value_stream(features)
+        advantages = self.advantage_stream(features)
+        return value + advantages - advantages.mean(dim=-1, keepdim=True)
+
+
 class ReplayBuffer:
     def __init__(self, capacity: int) -> None:
         """
@@ -128,8 +160,8 @@ class DQNAgent(BaseAgent):
         self.eps_decay: float = eps_decay
         self.action_adapter = ActionAdapter(action_type, max_order)
 
-        self.q_network = QNetwork(state_size, action_size, hidden_size)
-        self.target_network = QNetwork(state_size, action_size, hidden_size)
+        self.q_network = self._build_network(state_size, action_size, hidden_size)
+        self.target_network = self._build_network(state_size, action_size, hidden_size)
         self.target_network.load_state_dict(self.q_network.state_dict())
 
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
@@ -137,6 +169,11 @@ class DQNAgent(BaseAgent):
         self.memory = ReplayBuffer(buffer_size)
         self.t_step: int = 0
         self.pending_updates: int = 0
+
+    def _build_network(
+        self, state_size: int, action_size: int, hidden_size: int
+    ) -> nn.Module:
+        return QNetwork(state_size, action_size, hidden_size)
 
     def observe(self, transition: Transition) -> None:
         """
@@ -290,3 +327,12 @@ class DoubleDQNAgent(DQNAgent):
         best_actions = torch.argmax(self.q_network(next_states), dim=1, keepdim=True)
         next_q_values = self.target_network(next_states).gather(1, best_actions)
         return rewards + (self.gamma * next_q_values * (1 - dones))
+
+
+class DuelingDQNAgent(DQNAgent):
+    algo_name = "dueling_dqn"
+
+    def _build_network(
+        self, state_size: int, action_size: int, hidden_size: int
+    ) -> nn.Module:
+        return DuelingQNetwork(state_size, action_size, hidden_size)
