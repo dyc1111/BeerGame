@@ -1,5 +1,11 @@
+from __future__ import annotations
+
 import os
 from pathlib import Path
+from typing import Any, Protocol
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
 import hydra
 import matplotlib.pyplot as plt
 import torch
@@ -7,27 +13,35 @@ from hydra.utils import to_absolute_path
 from omegaconf import OmegaConf
 
 from algo import build_agent
-from algo.base import Transition
+from algo.base import ActionResult, BaseAgent, Transition
 from env import Env
+
+History = list[list[torch.Tensor]]
+TestResult = tuple[list[torch.Tensor], History, History, History, History]
+
+
+class OpponentPolicy(Protocol):
+    def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor:
+        ...
 
 
 class RandomOrderPolicy:
-    def __init__(self, max_order):
-        self.max_order = max_order
+    def __init__(self, max_order: int) -> None:
+        self.max_order: int = max_order
 
-    def act(self, *_):
+    def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor:
         return torch.randint(1, self.max_order + 1, ()).float()
 
 
 class ConstantOrderPolicy:
-    def __init__(self, order):
-        self.order = float(order)
+    def __init__(self, order: float) -> None:
+        self.order: float = float(order)
 
-    def act(self, *_):
+    def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor:
         return torch.tensor(self.order, dtype=torch.float32)
 
 
-def build_opponent_policy(config):
+def build_opponent_policy(config: Any) -> OpponentPolicy:
     policy_name = config["opponents"].get("policy", "random")
     if policy_name == "random":
         return RandomOrderPolicy(config["env"]["max_order"])
@@ -36,7 +50,7 @@ def build_opponent_policy(config):
     raise ValueError(f"Unknown opponent policy: {policy_name}")
 
 
-def build_env(config):
+def build_env(config: Any) -> Env:
     env_config = config["env"]
     return Env(
         env_config["num_firms"],
@@ -49,7 +63,7 @@ def build_env(config):
     )
 
 
-def build_configured_agent(config):
+def build_configured_agent(config: Any) -> BaseAgent:
     env_config = config["env"]
     algo_config = config["algo"]
     agent_config = {
@@ -59,7 +73,7 @@ def build_configured_agent(config):
     return build_agent(algo_config["name"], **agent_config)
 
 
-def build_output_dirs(config):
+def build_output_dirs(config: Any) -> tuple[Path, Path]:
     algo_name = config["algo"]["name"]
     exp = str(config.get("exp", "debug"))
     model_root = config["output"].get("model_root", "models")
@@ -71,9 +85,15 @@ def build_output_dirs(config):
     return model_dir, figure_dir
 
 
-def collect_actions(env, agent, opponent_policy, state, mode):
+def collect_actions(
+    env: Env,
+    agent: BaseAgent,
+    opponent_policy: OpponentPolicy,
+    state: torch.Tensor,
+    mode: str,
+) -> tuple[torch.Tensor, ActionResult]:
     actions = torch.zeros(env.num_firms, dtype=torch.float32)
-    action_result = None
+    action_result: ActionResult | None = None
 
     for firm_id in range(env.num_firms):
         if firm_id == agent.firm_id:
@@ -82,14 +102,22 @@ def collect_actions(env, agent, opponent_policy, state, mode):
         else:
             actions[firm_id] = opponent_policy.act(state[firm_id], firm_id)
 
+    if action_result is None:
+        raise RuntimeError(f"No action was collected for firm_id={agent.firm_id}")
     return actions, action_result
 
 
-def train(env, agent, opponent_policy, train_config, model_dir):
+def train(
+    env: Env,
+    agent: BaseAgent,
+    opponent_policy: OpponentPolicy,
+    train_config: Any,
+    model_dir: Path,
+) -> list[torch.Tensor]:
     """
     Train any agent that implements the BaseAgent API.
     """
-    scores = []
+    scores: list[torch.Tensor] = []
     num_episodes = train_config.get("num_episodes", 1000)
     max_t = train_config.get("max_t", env.max_steps)
     log_every = train_config.get("log_every", 100)
@@ -99,7 +127,7 @@ def train(env, agent, opponent_policy, train_config, model_dir):
     for i_episode in range(1, num_episodes + 1):
         state = env.reset()
         score = torch.tensor(0.0)
-        last_update_metrics = {}
+        last_update_metrics: dict[str, float] = {}
 
         for _ in range(max_t):
             actions, action_result = collect_actions(
@@ -170,23 +198,28 @@ def train(env, agent, opponent_policy, train_config, model_dir):
     return scores
 
 
-def test(env, agent, opponent_policy, num_episodes=10):
+def test(
+    env: Env,
+    agent: BaseAgent,
+    opponent_policy: OpponentPolicy,
+    num_episodes: int = 10,
+) -> TestResult:
     """
     Test any trained agent that implements the BaseAgent API.
     """
-    scores = []
-    inventory_history = []
-    orders_history = []
-    demand_history = []
-    satisfied_demand_history = []
+    scores: list[torch.Tensor] = []
+    inventory_history: History = []
+    orders_history: History = []
+    demand_history: History = []
+    satisfied_demand_history: History = []
 
     for i_episode in range(1, num_episodes + 1):
         state = env.reset()
         score = torch.tensor(0.0)
-        episode_inventory = []
-        episode_orders = []
-        episode_demand = []
-        episode_satisfied_demand = []
+        episode_inventory: list[torch.Tensor] = []
+        episode_orders: list[torch.Tensor] = []
+        episode_demand: list[torch.Tensor] = []
+        episode_satisfied_demand: list[torch.Tensor] = []
 
         for _ in range(env.max_steps):
             actions, _ = collect_actions(
@@ -224,7 +257,12 @@ def test(env, agent, opponent_policy, num_episodes=10):
     )
 
 
-def plot_training_results(scores, algo_name, figure_dir, window_size=100):
+def plot_training_results(
+    scores: list[torch.Tensor],
+    algo_name: str,
+    figure_dir: Path,
+    window_size: int = 100,
+) -> None:
     """
     Plot training rewards.
     """
@@ -233,7 +271,7 @@ def plot_training_results(scores, algo_name, figure_dir, window_size=100):
         [torch.as_tensor(score, dtype=torch.float32).reshape(()) for score in scores]
     )
 
-    def moving_average(data, window_size):
+    def moving_average(data: torch.Tensor, window_size: int) -> torch.Tensor:
         return torch.stack(
             [data[max(0, i - window_size) : i + 1].mean() for i in range(len(data))]
         )
@@ -261,18 +299,18 @@ def plot_training_results(scores, algo_name, figure_dir, window_size=100):
 
 
 def plot_test_results(
-    scores,
-    inventory_history,
-    orders_history,
-    demand_history,
-    satisfied_demand_history,
-    figure_dir,
-):
+    scores: list[torch.Tensor],
+    inventory_history: History,
+    orders_history: History,
+    demand_history: History,
+    satisfied_demand_history: History,
+    figure_dir: Path,
+) -> None:
     """
     Plot test results.
     """
 
-    def history_to_tensor(history):
+    def history_to_tensor(history: History) -> torch.Tensor:
         return torch.stack(
             [
                 torch.stack(
@@ -323,7 +361,7 @@ def plot_test_results(
 
 
 @hydra.main(config_path="cfg", config_name="base", version_base=None)
-def main(config):
+def main(config: Any) -> None:
     model_dir, figure_dir = build_output_dirs(config)
     env = build_env(config)
     agent = build_configured_agent(config)

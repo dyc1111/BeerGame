@@ -1,17 +1,28 @@
+from __future__ import annotations
+
 import os
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical, Normal
 
-from .base import ActionAdapter, ActionResult, BaseAgent
+from .base import ActionAdapter, ActionResult, BaseAgent, Pathish, Transition
+
+TensorBatch = dict[str, torch.Tensor]
 
 
 class ActorCriticNetwork(nn.Module):
-    def __init__(self, state_size, action_size, hidden_size, action_type):
+    def __init__(
+        self,
+        state_size: int,
+        action_size: int,
+        hidden_size: int,
+        action_type: str,
+    ) -> None:
         super().__init__()
-        self.action_type = action_type
+        self.action_type: str = action_type
         self.shared = nn.Sequential(
             nn.Linear(state_size, hidden_size),
             nn.Tanh(),
@@ -26,13 +37,13 @@ class ActorCriticNetwork(nn.Module):
             self.policy_head = nn.Linear(hidden_size, 1)
             self.log_std = nn.Parameter(torch.zeros(1))
 
-    def forward(self, states):
+    def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.shared(states)
         policy_output = self.policy_head(features)
         values = self.value_head(features).squeeze(-1)
         return policy_output, values
 
-    def distribution(self, states):
+    def distribution(self, states: torch.Tensor) -> tuple[Any, torch.Tensor]:
         policy_output, values = self.forward(states)
         if self.action_type == "discrete":
             return Categorical(logits=policy_output), values
@@ -42,16 +53,16 @@ class ActorCriticNetwork(nn.Module):
 
 
 class RolloutBuffer:
-    def __init__(self):
-        self.transitions = []
+    def __init__(self) -> None:
+        self.transitions: list[Transition] = []
 
-    def add(self, transition):
+    def add(self, transition: Transition) -> None:
         self.transitions.append(transition)
 
-    def clear(self):
+    def clear(self) -> None:
         self.transitions.clear()
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.transitions)
 
 
@@ -60,43 +71,43 @@ class PPOAgent(BaseAgent):
 
     def __init__(
         self,
-        state_size,
-        action_size,
-        firm_id,
-        max_order=20,
-        hidden_size=64,
-        gamma=0.99,
-        learning_rate=3e-4,
-        action_type="discrete",
-        rollout_steps=100,
-        minibatch_size=64,
-        ppo_epochs=4,
-        clip_coef=0.2,
-        value_coef=0.5,
-        entropy_coef=0.01,
-        gae_lambda=0.95,
-        max_grad_norm=0.5,
-        normalize_advantages=True,
-        **_,
-    ):
+        state_size: int,
+        action_size: int,
+        firm_id: int,
+        max_order: int = 20,
+        hidden_size: int = 64,
+        gamma: float = 0.99,
+        learning_rate: float = 3e-4,
+        action_type: str = "discrete",
+        rollout_steps: int = 100,
+        minibatch_size: int = 64,
+        ppo_epochs: int = 4,
+        clip_coef: float = 0.2,
+        value_coef: float = 0.5,
+        entropy_coef: float = 0.01,
+        gae_lambda: float = 0.95,
+        max_grad_norm: float = 0.5,
+        normalize_advantages: bool = True,
+        **_: Any,
+    ) -> None:
         if action_type not in {"discrete", "continuous"}:
             raise ValueError(f"Unknown action type: {action_type}")
 
-        self.state_size = state_size
-        self.action_size = action_size
-        self.firm_id = firm_id
-        self.max_order = max_order
-        self.gamma = gamma
-        self.action_type = action_type
-        self.rollout_steps = rollout_steps
-        self.minibatch_size = minibatch_size
-        self.ppo_epochs = ppo_epochs
-        self.clip_coef = clip_coef
-        self.value_coef = value_coef
-        self.entropy_coef = entropy_coef
-        self.gae_lambda = gae_lambda
-        self.max_grad_norm = max_grad_norm
-        self.normalize_advantages = normalize_advantages
+        self.state_size: int = state_size
+        self.action_size: int = action_size
+        self.firm_id: int = firm_id
+        self.max_order: int = max_order
+        self.gamma: float = gamma
+        self.action_type: str = action_type
+        self.rollout_steps: int = rollout_steps
+        self.minibatch_size: int = minibatch_size
+        self.ppo_epochs: int = ppo_epochs
+        self.clip_coef: float = clip_coef
+        self.value_coef: float = value_coef
+        self.entropy_coef: float = entropy_coef
+        self.gae_lambda: float = gae_lambda
+        self.max_grad_norm: float = max_grad_norm
+        self.normalize_advantages: bool = normalize_advantages
 
         self.action_adapter = ActionAdapter(action_type, max_order)
         self.network = ActorCriticNetwork(
@@ -104,9 +115,9 @@ class PPOAgent(BaseAgent):
         )
         self.optimizer = optim.Adam(self.network.parameters(), lr=learning_rate)
         self.rollout = RolloutBuffer()
-        self.pending_update = False
+        self.pending_update: bool = False
 
-    def act(self, obs, mode="train"):
+    def act(self, obs: Any, mode: str = "train") -> ActionResult:
         obs = torch.as_tensor(obs, dtype=torch.float32).flatten().unsqueeze(0)
 
         with torch.no_grad():
@@ -132,23 +143,23 @@ class PPOAgent(BaseAgent):
             value=value.reshape(()).detach().clone(),
         )
 
-    def observe(self, transition):
+    def observe(self, transition: Transition) -> None:
         self.rollout.add(transition)
         if len(self.rollout) >= self.rollout_steps:
             self.pending_update = True
 
-    def ready_to_update(self):
+    def ready_to_update(self) -> bool:
         return self.pending_update and len(self.rollout) > 0
 
-    def update(self):
+    def update(self) -> dict[str, float]:
         if not self.ready_to_update():
             return {}
 
         batch = self._build_batch()
-        losses = []
-        policy_losses = []
-        value_losses = []
-        entropy_losses = []
+        losses: list[float] = []
+        policy_losses: list[float] = []
+        value_losses: list[float] = []
+        entropy_losses: list[float] = []
 
         batch_size = batch["states"].shape[0]
         minibatch_size = min(self.minibatch_size, batch_size)
@@ -173,11 +184,11 @@ class PPOAgent(BaseAgent):
             "entropy": float(torch.tensor(entropy_losses).mean().item()),
         }
 
-    def on_episode_end(self):
+    def on_episode_end(self) -> None:
         if len(self.rollout) > 0:
             self.pending_update = True
 
-    def _build_batch(self):
+    def _build_batch(self) -> TensorBatch:
         transitions = self.rollout.transitions
         states = torch.stack(
             [torch.as_tensor(t.obs, dtype=torch.float32).flatten() for t in transitions]
@@ -189,7 +200,10 @@ class PPOAgent(BaseAgent):
             ]
         )
         rewards = torch.stack(
-            [torch.as_tensor(t.reward, dtype=torch.float32).reshape(()) for t in transitions]
+            [
+                torch.as_tensor(t.reward, dtype=torch.float32).reshape(())
+                for t in transitions
+            ]
         )
         dones = torch.tensor([t.done for t in transitions], dtype=torch.float32)
         old_log_probs = torch.stack(
@@ -207,7 +221,11 @@ class PPOAgent(BaseAgent):
         advantages = torch.zeros_like(rewards)
         gae = torch.tensor(0.0)
         for step in reversed(range(len(transitions))):
-            next_value = next_values[step] if step == len(transitions) - 1 else values[step + 1]
+            next_value = (
+                next_values[step]
+                if step == len(transitions) - 1
+                else values[step + 1]
+            )
             non_terminal = 1.0 - dones[step]
             delta = rewards[step] + self.gamma * next_value * non_terminal - values[step]
             gae = delta + self.gamma * self.gae_lambda * non_terminal * gae
@@ -225,7 +243,7 @@ class PPOAgent(BaseAgent):
             "returns": returns.detach(),
         }
 
-    def _training_action(self, transition):
+    def _training_action(self, transition: Transition) -> torch.Tensor:
         if transition.raw_action is not None:
             action = torch.as_tensor(transition.raw_action)
         elif self.action_type == "discrete":
@@ -237,7 +255,9 @@ class PPOAgent(BaseAgent):
             return action.long().reshape(())
         return action.float().reshape(1)
 
-    def _update_minibatch(self, batch, indices):
+    def _update_minibatch(
+        self, batch: TensorBatch, indices: torch.Tensor
+    ) -> dict[str, float]:
         states = batch["states"][indices]
         actions = batch["actions"][indices]
         old_log_probs = batch["old_log_probs"][indices]
@@ -278,7 +298,8 @@ class PPOAgent(BaseAgent):
             "entropy": entropy_bonus.item(),
         }
 
-    def save(self, filename):
+    def save(self, filename: Pathish) -> None:
+        filename = os.fspath(filename)
         directory = os.path.dirname(filename)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -291,7 +312,8 @@ class PPOAgent(BaseAgent):
         )
         print(f"Model saved to {filename}")
 
-    def load(self, filename):
+    def load(self, filename: Pathish) -> bool:
+        filename = os.fspath(filename)
         if os.path.isfile(filename):
             checkpoint = torch.load(filename, weights_only=True)
             self.network.load_state_dict(checkpoint["network_state_dict"])

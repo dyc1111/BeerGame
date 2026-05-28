@@ -1,10 +1,21 @@
+from __future__ import annotations
+
+from typing import Sequence
+
 import torch
 
 
 class Env:
     def __init__(
-        self, num_firms, p, h, c, initial_inventory, poisson_lambda=10, max_steps=100
-    ):
+        self,
+        num_firms: int,
+        p: Sequence[float],
+        h: float,
+        c: float,
+        initial_inventory: float,
+        poisson_lambda: float = 10,
+        max_steps: int = 100,
+    ) -> None:
         """
         Initialize the supply chain management simulation environment.
 
@@ -16,17 +27,23 @@ class Env:
         :param poisson_lambda: Mean of the downstream firm's Poisson demand
         :param max_steps: Maximum number of steps per episode
         """
-        self.num_firms = num_firms
-        self.p = torch.tensor(p + [0], dtype=torch.float32)
-        self.firm_state_size = 3
-        self.h = h
-        self.c = c
-        self.poisson_lambda = float(poisson_lambda)
-        self.max_steps = max_steps
-        self.initial_inventory = float(initial_inventory)
+        self.num_firms: int = num_firms
+        self.p = torch.tensor(list(p) + [0], dtype=torch.float32)
+        self.firm_state_size: int = 3
+        self.h: float = h
+        self.c: float = c
+        self.poisson_lambda: float = float(poisson_lambda)
+        self.max_steps: int = max_steps
+        self.initial_inventory: float = float(initial_inventory)
+        self.inventory: torch.Tensor
+        self.orders: torch.Tensor
+        self.demand: torch.Tensor
+        self.satisfied_demand: torch.Tensor
+        self.current_step: int
+        self.done: bool
         self.reset()
 
-    def reset(self):
+    def reset(self) -> torch.Tensor:
         """
         reset the environment
         """
@@ -39,16 +56,16 @@ class Env:
         self.done = False
         return self._get_observation()
 
-    def _get_observation(self):
+    def _get_observation(self) -> torch.Tensor:
         return torch.stack((self.orders, self.satisfied_demand, self.inventory), dim=1)
 
-    def _generate_demand(self):
+    def _generate_demand(self) -> torch.Tensor:
         demand = torch.zeros(self.num_firms, dtype=torch.float32)
         demand[0] = torch.poisson(torch.tensor(self.poisson_lambda))
         demand[1:] = self.orders[:-1]
         return demand
 
-    def step(self, actions):
+    def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, bool]:
         """
         Run one simulation time step and update the environment state from the
         given actions, where each action is a firm's order quantity.

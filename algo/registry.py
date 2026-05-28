@@ -1,8 +1,15 @@
+from __future__ import annotations
+
+from typing import Any, TypeAlias
+
+from .base import BaseAgent
 from .dqn import DQNAgent, DoubleDQNAgent
 from .not_implemented import SACAgent, TRPOAgent
 from .ppo import PPOAgent
 
-ALGORITHMS = {
+AgentClass: TypeAlias = type[BaseAgent]
+
+ALGORITHMS: dict[str, AgentClass] = {
     "dqn": DQNAgent,
     "double_dqn": DoubleDQNAgent,
     "ppo": PPOAgent,
@@ -11,7 +18,7 @@ ALGORITHMS = {
 }
 
 
-def build_agent(name, **kwargs):
+def build_agent(name: str, **kwargs: Any) -> BaseAgent:
     if name not in ALGORITHMS:
         known = ", ".join(sorted(ALGORITHMS))
         raise ValueError(f"Unknown algorithm '{name}'. Available algorithms: {known}")
