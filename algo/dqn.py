@@ -9,7 +9,7 @@ from collections import deque
 import os
 from typing import Any
 
-from .base import ActionAdapter, ActionResult, BaseAgent, Pathish, Transition
+from .base import ActionResult, BaseAgent, Pathish, Transition
 
 Experience = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]
 
@@ -129,7 +129,7 @@ class DQNAgent(BaseAgent):
         eps_start: float = 1.0,
         eps_end: float = 0.01,
         eps_decay: float = 0.995,
-        action_type: str = "discrete",
+        device: torch.device | str = "cpu",
     ) -> None:
         """
         Initialize the DQN agent.
@@ -158,10 +158,11 @@ class DQNAgent(BaseAgent):
         self.epsilon: float = eps_start
         self.eps_end: float = eps_end
         self.eps_decay: float = eps_decay
-        self.action_adapter = ActionAdapter(action_type, max_order)
-
+        self.device = torch.device(device)
         self.q_network = self._build_network(state_size, action_size, hidden_size)
         self.target_network = self._build_network(state_size, action_size, hidden_size)
+        self.q_network.to(self.device)
+        self.target_network.to(self.device)
         self.target_network.load_state_dict(self.q_network.state_dict())
 
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
@@ -210,7 +211,7 @@ class DQNAgent(BaseAgent):
         :param mode: "train" enables epsilon-greedy exploration, "eval" is greedy
         :return: Selected action
         """
-        state = torch.as_tensor(state, dtype=torch.float32).flatten()
+        state = torch.as_tensor(state, dtype=torch.float32, device=self.device).flatten()
 
         self.q_network.eval()
         with torch.no_grad():
@@ -221,9 +222,11 @@ class DQNAgent(BaseAgent):
         if random.random() > epsilon:
             raw_action = torch.argmax(action_values).reshape(())
         else:
-            raw_action = torch.randint(0, self.max_order, ()).reshape(())
+            raw_action = torch.randint(
+                0, self.max_order, (), device=self.device
+            ).reshape(())
 
-        env_action = self.action_adapter.to_env_action(raw_action)
+        env_action = (raw_action.long().clamp(0, self.max_order - 1) + 1).float()
         return ActionResult(env_action=env_action, raw_action=raw_action)
 
     def ready_to_update(self) -> bool:
@@ -247,11 +250,11 @@ class DQNAgent(BaseAgent):
         :param experiences: Tuple of (state, action, reward, next_state, done)
         """
         states, actions, rewards, next_states, dones = zip(*experiences)
-        states = torch.stack(states).float()
-        actions = torch.stack(actions).long().unsqueeze(1) - 1
-        rewards = torch.stack(rewards).float().unsqueeze(1)
-        next_states = torch.stack(next_states).float()
-        dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(1)
+        states = torch.stack(states).float().to(self.device)
+        actions = torch.stack(actions).long().to(self.device).unsqueeze(1) - 1
+        rewards = torch.stack(rewards).float().to(self.device).unsqueeze(1)
+        next_states = torch.stack(next_states).float().to(self.device)
+        dones = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
 
         Q_targets = self._compute_q_targets(rewards, next_states, dones)
         Q_expected = torch.gather(self.q_network(states), 1, actions)
@@ -306,7 +309,7 @@ class DQNAgent(BaseAgent):
         """
         filename = os.fspath(filename)
         if os.path.isfile(filename):
-            checkpoint = torch.load(filename, weights_only=True)
+            checkpoint = torch.load(filename, weights_only=True, map_location=self.device)
             self.q_network.load_state_dict(checkpoint["q_network_state_dict"])
             self.target_network.load_state_dict(checkpoint["target_network_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

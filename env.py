@@ -15,6 +15,7 @@ class Env:
         initial_inventory: float,
         poisson_lambda: float = 10,
         max_steps: int = 100,
+        device: torch.device | str = "cpu",
     ) -> None:
         """
         Initialize the supply chain management simulation environment.
@@ -28,7 +29,8 @@ class Env:
         :param max_steps: Maximum number of steps per episode
         """
         self.num_firms: int = num_firms
-        self.p = torch.tensor(list(p) + [0], dtype=torch.float32)
+        self.device = torch.device(device)
+        self.p = torch.tensor(list(p) + [0], dtype=torch.float32, device=self.device)
         self.firm_state_size: int = 3
         self.h: float = h
         self.c: float = c
@@ -48,10 +50,16 @@ class Env:
         reset the environment
         """
         self.inventory = torch.full(
-            (self.num_firms,), self.initial_inventory, dtype=torch.float32
+            (self.num_firms,),
+            self.initial_inventory,
+            dtype=torch.float32,
+            device=self.device,
         )
-        self.orders = torch.zeros(self.num_firms, dtype=torch.float32)
-        self.satisfied_demand = torch.zeros(self.num_firms, dtype=torch.float32)
+        self.orders = torch.zeros(self.num_firms, dtype=torch.float32, device=self.device)
+        self.demand = torch.zeros(self.num_firms, dtype=torch.float32, device=self.device)
+        self.satisfied_demand = torch.zeros(
+            self.num_firms, dtype=torch.float32, device=self.device
+        )
         self.current_step = 0
         self.done = False
         return self._get_observation()
@@ -60,8 +68,10 @@ class Env:
         return torch.stack((self.orders, self.satisfied_demand, self.inventory), dim=1)
 
     def _generate_demand(self) -> torch.Tensor:
-        demand = torch.zeros(self.num_firms, dtype=torch.float32)
-        demand[0] = torch.poisson(torch.tensor(self.poisson_lambda))
+        demand = torch.zeros(self.num_firms, dtype=torch.float32, device=self.device)
+        demand[0] = torch.poisson(
+            torch.tensor(self.poisson_lambda, dtype=torch.float32, device=self.device)
+        )
         demand[1:] = self.orders[:-1]
         return demand
 
@@ -73,7 +83,7 @@ class Env:
         :param actions: Each firm's order quantity (shape: (num_firms,))
         :return: next_state, reward, done
         """
-        self.orders = actions
+        self.orders = actions.to(self.device)
         self.demand = self._generate_demand()
         self.satisfied_demand = torch.minimum(self.demand, self.inventory)
         self.inventory += self.orders - self.satisfied_demand

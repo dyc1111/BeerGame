@@ -29,25 +29,10 @@ class Transition:
     value: Optional[torch.Tensor] = None
 
 
-class ActionAdapter:
-    def __init__(self, action_type: str = "discrete", max_order: int = 20) -> None:
-        if action_type not in {"discrete", "continuous"}:
-            raise ValueError(f"Unknown action type: {action_type}")
-        self.action_type = action_type
-        self.max_order = max_order
-
-    def to_env_action(self, action: Any) -> torch.Tensor:
-        action = torch.as_tensor(action)
-        if self.action_type == "discrete":
-            action = action.long().clamp(0, self.max_order - 1) + 1
-            return action.float().reshape(())
-        action = action.float().round().clamp(1, self.max_order)
-        return action.reshape(())
-
-
 class BaseAgent:
     algo_name = "base"
     firm_id: int
+    device: torch.device
 
     def act(self, obs: Any, mode: str = "train") -> ActionResult:
         raise NotImplementedError

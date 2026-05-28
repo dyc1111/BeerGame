@@ -6,9 +6,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import Categorical, Normal
+from torch.distributions import Categorical
 
-from .base import ActionAdapter, ActionResult, BaseAgent, Pathish, Transition
+from .base import ActionResult, BaseAgent, Pathish, Transition
 
 TensorBatch = dict[str, torch.Tensor]
 
@@ -19,10 +19,8 @@ class ActorCriticNetwork(nn.Module):
         state_size: int,
         action_size: int,
         hidden_size: int,
-        action_type: str,
     ) -> None:
         super().__init__()
-        self.action_type: str = action_type
         self.shared = nn.Sequential(
             nn.Linear(state_size, hidden_size),
             nn.Tanh(),
@@ -30,12 +28,7 @@ class ActorCriticNetwork(nn.Module):
             nn.Tanh(),
         )
         self.value_head = nn.Linear(hidden_size, 1)
-        if action_type == "discrete":
-            self.policy_head = nn.Linear(hidden_size, action_size)
-            self.log_std = None
-        else:
-            self.policy_head = nn.Linear(hidden_size, 1)
-            self.log_std = nn.Parameter(torch.zeros(1))
+        self.policy_head = nn.Linear(hidden_size, action_size)
 
     def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.shared(states)
@@ -45,11 +38,7 @@ class ActorCriticNetwork(nn.Module):
 
     def distribution(self, states: torch.Tensor) -> tuple[Any, torch.Tensor]:
         policy_output, values = self.forward(states)
-        if self.action_type == "discrete":
-            return Categorical(logits=policy_output), values
-
-        std = self.log_std.exp().expand_as(policy_output)
-        return Normal(policy_output, std), values
+        return Categorical(logits=policy_output), values
 
 
 class RolloutBuffer:
@@ -78,7 +67,6 @@ class PPOAgent(BaseAgent):
         hidden_size: int = 64,
         gamma: float = 0.99,
         learning_rate: float = 3e-4,
-        action_type: str = "discrete",
         rollout_steps: int = 100,
         minibatch_size: int = 64,
         ppo_epochs: int = 4,
@@ -88,17 +76,14 @@ class PPOAgent(BaseAgent):
         gae_lambda: float = 0.95,
         max_grad_norm: float = 0.5,
         normalize_advantages: bool = True,
+        device: torch.device | str = "cpu",
         **_: Any,
     ) -> None:
-        if action_type not in {"discrete", "continuous"}:
-            raise ValueError(f"Unknown action type: {action_type}")
-
         self.state_size: int = state_size
         self.action_size: int = action_size
         self.firm_id: int = firm_id
         self.max_order: int = max_order
         self.gamma: float = gamma
-        self.action_type: str = action_type
         self.rollout_steps: int = rollout_steps
         self.minibatch_size: int = minibatch_size
         self.ppo_epochs: int = ppo_epochs
@@ -108,34 +93,32 @@ class PPOAgent(BaseAgent):
         self.gae_lambda: float = gae_lambda
         self.max_grad_norm: float = max_grad_norm
         self.normalize_advantages: bool = normalize_advantages
+        self.device = torch.device(device)
 
-        self.action_adapter = ActionAdapter(action_type, max_order)
-        self.network = ActorCriticNetwork(
-            state_size, action_size, hidden_size, action_type
-        )
+        self.network = ActorCriticNetwork(state_size, action_size, hidden_size)
+        self.network.to(self.device)
         self.optimizer = optim.Adam(self.network.parameters(), lr=learning_rate)
         self.rollout = RolloutBuffer()
         self.pending_update: bool = False
 
     def act(self, obs: Any, mode: str = "train") -> ActionResult:
-        obs = torch.as_tensor(obs, dtype=torch.float32).flatten().unsqueeze(0)
+        obs = (
+            torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+            .flatten()
+            .unsqueeze(0)
+        )
 
         with torch.no_grad():
             distribution, value = self.network.distribution(obs)
             if mode == "train":
                 raw_action = distribution.sample()
-            elif self.action_type == "discrete":
-                raw_action = torch.argmax(distribution.logits, dim=-1)
             else:
-                raw_action = distribution.mean
+                raw_action = torch.argmax(distribution.logits, dim=-1)
 
             log_prob = distribution.log_prob(raw_action)
-            if self.action_type == "continuous":
-                raw_action = raw_action.squeeze(-1)
-                log_prob = log_prob.squeeze(-1)
 
         raw_action = raw_action.reshape(())
-        env_action = self.action_adapter.to_env_action(raw_action)
+        env_action = (raw_action.long().clamp(0, self.max_order - 1) + 1).float()
         return ActionResult(
             env_action=env_action,
             raw_action=raw_action.detach().clone(),
@@ -165,7 +148,7 @@ class PPOAgent(BaseAgent):
         minibatch_size = min(self.minibatch_size, batch_size)
 
         for _ in range(self.ppo_epochs):
-            indices = torch.randperm(batch_size)
+            indices = torch.randperm(batch_size, device=self.device)
             for start in range(0, batch_size, minibatch_size):
                 mb_idx = indices[start : start + minibatch_size]
                 metrics = self._update_minibatch(batch, mb_idx)
@@ -178,10 +161,16 @@ class PPOAgent(BaseAgent):
         self.pending_update = False
 
         return {
-            "loss": float(torch.tensor(losses).mean().item()),
-            "policy_loss": float(torch.tensor(policy_losses).mean().item()),
-            "value_loss": float(torch.tensor(value_losses).mean().item()),
-            "entropy": float(torch.tensor(entropy_losses).mean().item()),
+            "loss": float(torch.tensor(losses, device=self.device).mean().item()),
+            "policy_loss": float(
+                torch.tensor(policy_losses, device=self.device).mean().item()
+            ),
+            "value_loss": float(
+                torch.tensor(value_losses, device=self.device).mean().item()
+            ),
+            "entropy": float(
+                torch.tensor(entropy_losses, device=self.device).mean().item()
+            ),
         }
 
     def on_episode_end(self) -> None:
@@ -191,24 +180,35 @@ class PPOAgent(BaseAgent):
     def _build_batch(self) -> TensorBatch:
         transitions = self.rollout.transitions
         states = torch.stack(
-            [torch.as_tensor(t.obs, dtype=torch.float32).flatten() for t in transitions]
+            [
+                torch.as_tensor(t.obs, dtype=torch.float32, device=self.device).flatten()
+                for t in transitions
+            ]
         )
         next_states = torch.stack(
             [
-                torch.as_tensor(t.next_obs, dtype=torch.float32).flatten()
+                torch.as_tensor(
+                    t.next_obs, dtype=torch.float32, device=self.device
+                ).flatten()
                 for t in transitions
             ]
         )
         rewards = torch.stack(
             [
-                torch.as_tensor(t.reward, dtype=torch.float32).reshape(())
+                torch.as_tensor(
+                    t.reward, dtype=torch.float32, device=self.device
+                ).reshape(())
                 for t in transitions
             ]
         )
-        dones = torch.tensor([t.done for t in transitions], dtype=torch.float32)
+        dones = torch.tensor(
+            [t.done for t in transitions], dtype=torch.float32, device=self.device
+        )
         old_log_probs = torch.stack(
             [
-                torch.as_tensor(t.log_prob, dtype=torch.float32).reshape(())
+                torch.as_tensor(
+                    t.log_prob, dtype=torch.float32, device=self.device
+                ).reshape(())
                 for t in transitions
             ]
         )
@@ -218,8 +218,8 @@ class PPOAgent(BaseAgent):
             _, values = self.network.distribution(states)
             _, next_values = self.network.distribution(next_states)
 
-        advantages = torch.zeros_like(rewards)
-        gae = torch.tensor(0.0)
+        advantages = torch.zeros_like(rewards, device=self.device)
+        gae = torch.tensor(0.0, device=self.device)
         for step in reversed(range(len(transitions))):
             next_value = (
                 next_values[step]
@@ -245,15 +245,11 @@ class PPOAgent(BaseAgent):
 
     def _training_action(self, transition: Transition) -> torch.Tensor:
         if transition.raw_action is not None:
-            action = torch.as_tensor(transition.raw_action)
-        elif self.action_type == "discrete":
-            action = torch.as_tensor(transition.action).long() - 1
+            action = torch.as_tensor(transition.raw_action, device=self.device)
         else:
-            action = torch.as_tensor(transition.action).float()
+            action = torch.as_tensor(transition.action, device=self.device).long() - 1
 
-        if self.action_type == "discrete":
-            return action.long().reshape(())
-        return action.float().reshape(1)
+        return action.long().reshape(())
 
     def _update_minibatch(
         self, batch: TensorBatch, indices: torch.Tensor
@@ -267,10 +263,6 @@ class PPOAgent(BaseAgent):
         distribution, values = self.network.distribution(states)
         log_probs = distribution.log_prob(actions)
         entropy = distribution.entropy()
-
-        if self.action_type == "continuous":
-            log_probs = log_probs.squeeze(-1)
-            entropy = entropy.squeeze(-1)
 
         ratio = torch.exp(log_probs - old_log_probs)
         unclipped_policy_loss = -advantages * ratio
@@ -315,7 +307,7 @@ class PPOAgent(BaseAgent):
     def load(self, filename: Pathish) -> bool:
         filename = os.fspath(filename)
         if os.path.isfile(filename):
-            checkpoint = torch.load(filename, weights_only=True)
+            checkpoint = torch.load(filename, weights_only=True, map_location=self.device)
             self.network.load_state_dict(checkpoint["network_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             print(f"Loaded model from {filename}")

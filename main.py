@@ -16,6 +16,8 @@ from algo import build_agent
 from algo.base import ActionResult, BaseAgent, Transition
 from env import Env
 
+DEFAULT_DEVICE_NAME = "cuda:0"
+
 History = list[list[torch.Tensor]]
 TestResult = tuple[list[torch.Tensor], History, History, History, History]
 
@@ -26,31 +28,41 @@ class OpponentPolicy(Protocol):
 
 
 class RandomOrderPolicy:
-    def __init__(self, max_order: int) -> None:
+    def __init__(self, max_order: int, device: torch.device) -> None:
         self.max_order: int = max_order
+        self.device: torch.device = device
 
     def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor:
-        return torch.randint(1, self.max_order + 1, ()).float()
+        return torch.randint(
+            1, self.max_order + 1, (), device=self.device
+        ).float()
 
 
 class ConstantOrderPolicy:
-    def __init__(self, order: float) -> None:
+    def __init__(self, order: float, device: torch.device) -> None:
         self.order: float = float(order)
+        self.device: torch.device = device
 
     def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor:
-        return torch.tensor(self.order, dtype=torch.float32)
+        return torch.tensor(self.order, dtype=torch.float32, device=self.device)
 
 
-def build_opponent_policy(config: Any) -> OpponentPolicy:
+def select_device(device_name: str = DEFAULT_DEVICE_NAME) -> torch.device:
+    if device_name.startswith("cuda") and torch.cuda.is_available():
+        return torch.device(device_name)
+    return torch.device("cpu")
+
+
+def build_opponent_policy(config: Any, device: torch.device) -> OpponentPolicy:
     policy_name = config["opponents"].get("policy", "random")
     if policy_name == "random":
-        return RandomOrderPolicy(config["env"]["max_order"])
+        return RandomOrderPolicy(config["env"]["max_order"], device)
     if policy_name == "constant":
-        return ConstantOrderPolicy(config["opponents"].get("constant_order", 10))
+        return ConstantOrderPolicy(config["opponents"].get("constant_order", 10), device)
     raise ValueError(f"Unknown opponent policy: {policy_name}")
 
 
-def build_env(config: Any) -> Env:
+def build_env(config: Any, device: torch.device) -> Env:
     env_config = config["env"]
     return Env(
         env_config["num_firms"],
@@ -60,15 +72,17 @@ def build_env(config: Any) -> Env:
         env_config["initial_inventory"],
         env_config["poisson_lambda"],
         env_config["max_steps"],
+        device=device,
     )
 
 
-def build_configured_agent(config: Any) -> BaseAgent:
+def build_configured_agent(config: Any, device: torch.device) -> BaseAgent:
     env_config = config["env"]
     algo_config = config["algo"]
     agent_config = {
         **OmegaConf.to_container(algo_config["agent"], resolve=True),
         "max_order": env_config["max_order"],
+        "device": device,
     }
     return build_agent(algo_config["name"], **agent_config)
 
@@ -92,7 +106,7 @@ def collect_actions(
     state: torch.Tensor,
     mode: str,
 ) -> tuple[torch.Tensor, ActionResult]:
-    actions = torch.zeros(env.num_firms, dtype=torch.float32)
+    actions = torch.zeros(env.num_firms, dtype=torch.float32, device=state.device)
     action_result: ActionResult | None = None
 
     for firm_id in range(env.num_firms):
@@ -126,7 +140,7 @@ def train(
 
     for i_episode in range(1, num_episodes + 1):
         state = env.reset()
-        score = torch.tensor(0.0)
+        score = torch.tensor(0.0, device=env.device)
         last_update_metrics: dict[str, float] = {}
 
         for _ in range(max_t):
@@ -215,7 +229,7 @@ def test(
 
     for i_episode in range(1, num_episodes + 1):
         state = env.reset()
-        score = torch.tensor(0.0)
+        score = torch.tensor(0.0, device=env.device)
         episode_inventory: list[torch.Tensor] = []
         episode_orders: list[torch.Tensor] = []
         episode_demand: list[torch.Tensor] = []
@@ -227,11 +241,11 @@ def test(
             )
             next_state, rewards, done = env.step(actions)
 
-            episode_inventory.append(env.inventory[agent.firm_id].detach().clone())
-            episode_orders.append(actions[agent.firm_id].detach().clone())
-            episode_demand.append(env.demand[agent.firm_id].detach().clone())
+            episode_inventory.append(env.inventory[agent.firm_id].detach().cpu().clone())
+            episode_orders.append(actions[agent.firm_id].detach().cpu().clone())
+            episode_demand.append(env.demand[agent.firm_id].detach().cpu().clone())
             episode_satisfied_demand.append(
-                env.satisfied_demand[agent.firm_id].detach().clone()
+                env.satisfied_demand[agent.firm_id].detach().cpu().clone()
             )
 
             score = score + rewards[agent.firm_id]
@@ -268,7 +282,10 @@ def plot_training_results(
     """
 
     score_tensor = torch.stack(
-        [torch.as_tensor(score, dtype=torch.float32).reshape(()) for score in scores]
+        [
+            torch.as_tensor(score, dtype=torch.float32).detach().cpu().reshape(())
+            for score in scores
+        ]
     )
 
     def moving_average(data: torch.Tensor, window_size: int) -> torch.Tensor:
@@ -315,7 +332,10 @@ def plot_test_results(
             [
                 torch.stack(
                     [
-                        torch.as_tensor(value, dtype=torch.float32).reshape(())
+                        torch.as_tensor(value, dtype=torch.float32)
+                        .detach()
+                        .cpu()
+                        .reshape(())
                         for value in episode
                     ]
                 )
@@ -328,7 +348,10 @@ def plot_test_results(
     avg_demand = history_to_tensor(demand_history).mean(dim=0)
     avg_satisfied_demand = history_to_tensor(satisfied_demand_history).mean(dim=0)
     score_tensor = torch.stack(
-        [torch.as_tensor(score, dtype=torch.float32).reshape(()) for score in scores]
+        [
+            torch.as_tensor(score, dtype=torch.float32).detach().cpu().reshape(())
+            for score in scores
+        ]
     )
 
     fig, axs = plt.subplots(2, 2, figsize=(14, 10))
@@ -362,10 +385,12 @@ def plot_test_results(
 
 @hydra.main(config_path="cfg", config_name="base", version_base=None)
 def main(config: Any) -> None:
+    device = select_device(DEFAULT_DEVICE_NAME)
+    print(f"Using device: {device}")
     model_dir, figure_dir = build_output_dirs(config)
-    env = build_env(config)
-    agent = build_configured_agent(config)
-    opponent_policy = build_opponent_policy(config)
+    env = build_env(config, device)
+    agent = build_configured_agent(config, device)
+    opponent_policy = build_opponent_policy(config, device)
 
     scores = train(env, agent, opponent_policy, config["train"], model_dir)
 

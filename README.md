@@ -9,8 +9,7 @@ algorithm configs live under `cfg/algo`.
 python main.py algo=ppo exp=my_run
 ```
 
-`dqn`, `double_dqn`, `dueling_dqn`, `ppo`, and `trpo` are implemented. `sac` is
-registered with an explicit placeholder so future implementations can plug into the
-same `BaseAgent` API without changing `train()` or `test()`.
+`dqn`, `double_dqn`, `dueling_dqn`, `ppo`, `trpo`, and `sac` are implemented with
+the same `BaseAgent` API, so `train()` and `test()` work across algorithms.
 
 Models are saved to `models/{algo}/{exp}` and figures to `figures/{algo}/{exp}`.

@@ -7,7 +7,6 @@ agent:
   hidden_size: 64
   gamma: 0.99
   learning_rate: 0.0001
-  action_type: discrete
   rollout_steps: 100
   minibatch_size: 64
   ppo_epochs: 10

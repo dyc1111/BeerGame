@@ -6,11 +6,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import Categorical, Normal
+from torch.distributions import Categorical
 from torch.distributions.kl import kl_divergence
 from torch.nn.utils.convert_parameters import parameters_to_vector, vector_to_parameters
 
-from .base import ActionAdapter, ActionResult, BaseAgent, Pathish, Transition
+from .base import ActionResult, BaseAgent, Pathish, Transition
 
 TensorBatch = dict[str, torch.Tensor]
 
@@ -21,35 +21,22 @@ class PolicyNetwork(nn.Module):
         state_size: int,
         action_size: int,
         hidden_size: int,
-        action_type: str,
     ) -> None:
         super().__init__()
-        self.action_type = action_type
         self.body = nn.Sequential(
             nn.Linear(state_size, hidden_size),
             nn.Tanh(),
             nn.Linear(hidden_size, hidden_size),
             nn.Tanh(),
         )
-        if action_type == "discrete":
-            self.output = nn.Linear(hidden_size, action_size)
-            self.log_std = None
-        else:
-            self.output = nn.Linear(hidden_size, 1)
-            self.log_std = nn.Parameter(torch.zeros(1))
+        self.output = nn.Linear(hidden_size, action_size)
 
     def forward(self, states: torch.Tensor) -> torch.Tensor:
         return self.output(self.body(states))
 
     def distribution(self, states: torch.Tensor) -> Any:
         output = self.forward(states)
-        if self.action_type == "discrete":
-            return Categorical(logits=output)
-
-        if self.log_std is None:
-            raise RuntimeError("Continuous policy is missing log_std")
-        std = self.log_std.exp().expand_as(output)
-        return Normal(output, std)
+        return Categorical(logits=output)
 
 
 class ValueNetwork(nn.Module):
@@ -93,7 +80,6 @@ class TRPOAgent(BaseAgent):
         hidden_size: int = 64,
         gamma: float = 0.99,
         critic_lr: float = 1e-3,
-        action_type: str = "discrete",
         rollout_steps: int = 100,
         gae_lambda: float = 0.95,
         max_kl: float = 1e-2,
@@ -103,17 +89,15 @@ class TRPOAgent(BaseAgent):
         line_search_decay: float = 0.5,
         value_epochs: int = 10,
         normalize_advantages: bool = True,
+        device: torch.device | str = "cpu",
         **_: Any,
     ) -> None:
-        if action_type not in {"discrete", "continuous"}:
-            raise ValueError(f"Unknown action type: {action_type}")
-
+        self.device = torch.device(device)
         self.state_size = state_size
         self.action_size = action_size
         self.firm_id = firm_id
         self.max_order = max_order
         self.gamma = gamma
-        self.action_type = action_type
         self.rollout_steps = rollout_steps
         self.gae_lambda = gae_lambda
         self.max_kl = max_kl
@@ -124,34 +108,32 @@ class TRPOAgent(BaseAgent):
         self.value_epochs = value_epochs
         self.normalize_advantages = normalize_advantages
 
-        self.action_adapter = ActionAdapter(action_type, max_order)
-        self.actor = PolicyNetwork(state_size, action_size, hidden_size, action_type)
-        self.critic = ValueNetwork(state_size, hidden_size)
+        self.actor = PolicyNetwork(state_size, action_size, hidden_size).to(self.device)
+        self.critic = ValueNetwork(state_size, hidden_size).to(self.device)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.value_loss = nn.MSELoss()
         self.rollout = RolloutBuffer()
         self.pending_update = False
 
     def act(self, obs: Any, mode: str = "train") -> ActionResult:
-        obs = torch.as_tensor(obs, dtype=torch.float32).flatten().unsqueeze(0)
+        obs = (
+            torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+            .flatten()
+            .unsqueeze(0)
+        )
 
         with torch.no_grad():
             distribution = self.actor.distribution(obs)
             value = self.critic(obs)
             if mode == "train":
                 raw_action = distribution.sample()
-            elif self.action_type == "discrete":
-                raw_action = torch.argmax(distribution.logits, dim=-1)
             else:
-                raw_action = distribution.mean
+                raw_action = torch.argmax(distribution.logits, dim=-1)
 
             log_prob = distribution.log_prob(raw_action)
-            if self.action_type == "continuous":
-                raw_action = raw_action.squeeze(-1)
-                log_prob = log_prob.squeeze(-1)
 
         raw_action = raw_action.reshape(())
-        env_action = self.action_adapter.to_env_action(raw_action)
+        env_action = (raw_action.long().clamp(0, self.max_order - 1) + 1).float()
         return ActionResult(
             env_action=env_action,
             raw_action=raw_action.detach().clone(),
@@ -192,24 +174,35 @@ class TRPOAgent(BaseAgent):
     def _build_batch(self) -> TensorBatch:
         transitions = self.rollout.transitions
         states = torch.stack(
-            [torch.as_tensor(t.obs, dtype=torch.float32).flatten() for t in transitions]
+            [
+                torch.as_tensor(t.obs, dtype=torch.float32, device=self.device).flatten()
+                for t in transitions
+            ]
         )
         next_states = torch.stack(
             [
-                torch.as_tensor(t.next_obs, dtype=torch.float32).flatten()
+                torch.as_tensor(
+                    t.next_obs, dtype=torch.float32, device=self.device
+                ).flatten()
                 for t in transitions
             ]
         )
         rewards = torch.stack(
             [
-                torch.as_tensor(t.reward, dtype=torch.float32).reshape(())
+                torch.as_tensor(
+                    t.reward, dtype=torch.float32, device=self.device
+                ).reshape(())
                 for t in transitions
             ]
         )
-        dones = torch.tensor([t.done for t in transitions], dtype=torch.float32)
+        dones = torch.tensor(
+            [t.done for t in transitions], dtype=torch.float32, device=self.device
+        )
         old_log_probs = torch.stack(
             [
-                torch.as_tensor(t.log_prob, dtype=torch.float32).reshape(())
+                torch.as_tensor(
+                    t.log_prob, dtype=torch.float32, device=self.device
+                ).reshape(())
                 for t in transitions
             ]
         )
@@ -220,7 +213,7 @@ class TRPOAgent(BaseAgent):
             next_values = self.critic(next_states)
 
         advantages = torch.zeros_like(rewards)
-        gae = torch.tensor(0.0)
+        gae = torch.tensor(0.0, device=self.device)
         for step in reversed(range(len(transitions))):
             next_value = (
                 next_values[step]
@@ -246,20 +239,16 @@ class TRPOAgent(BaseAgent):
 
     def _training_action(self, transition: Transition) -> torch.Tensor:
         if transition.raw_action is not None:
-            action = torch.as_tensor(transition.raw_action)
-        elif self.action_type == "discrete":
-            action = torch.as_tensor(transition.action).long() - 1
+            action = torch.as_tensor(transition.raw_action, device=self.device)
         else:
-            action = torch.as_tensor(transition.action).float()
+            action = torch.as_tensor(transition.action, device=self.device).long() - 1
 
-        if self.action_type == "discrete":
-            return action.long().reshape(())
-        return action.float().reshape(1)
+        return action.long().reshape(())
 
     def _update_critic(self, batch: TensorBatch) -> float:
         states = batch["states"]
         returns = batch["returns"]
-        loss = torch.tensor(0.0)
+        loss = torch.tensor(0.0, device=self.device)
 
         for _ in range(self.value_epochs):
             values = self.critic(states)
@@ -278,11 +267,6 @@ class TRPOAgent(BaseAgent):
 
         with torch.no_grad():
             old_policy_output = self.actor(states).detach()
-            old_log_std = (
-                self.actor.log_std.detach().clone()
-                if self.action_type == "continuous" and self.actor.log_std is not None
-                else None
-            )
             old_surrogate = self._surrogate_loss(
                 states, actions, old_log_probs, advantages
             ).detach()
@@ -296,12 +280,12 @@ class TRPOAgent(BaseAgent):
 
         step_direction = self._conjugate_gradient(
             lambda vector: self._hessian_vector_product(
-                states, old_policy_output, old_log_std, vector
+                states, old_policy_output, vector
             ),
             flat_grads,
         )
         hvp_step = self._hessian_vector_product(
-            states, old_policy_output, old_log_std, step_direction
+            states, old_policy_output, step_direction
         )
         curvature = torch.dot(step_direction, hvp_step)
         if curvature <= 0:
@@ -315,7 +299,6 @@ class TRPOAgent(BaseAgent):
             old_log_probs,
             advantages,
             old_policy_output,
-            old_log_std,
             old_surrogate,
             full_step,
         )
@@ -330,8 +313,6 @@ class TRPOAgent(BaseAgent):
     ) -> torch.Tensor:
         distribution = self.actor.distribution(states)
         log_probs = distribution.log_prob(actions)
-        if self.action_type == "continuous":
-            log_probs = log_probs.squeeze(-1)
         ratio = torch.exp(log_probs - old_log_probs)
         return torch.mean(ratio * advantages)
 
@@ -339,30 +320,19 @@ class TRPOAgent(BaseAgent):
         self,
         states: torch.Tensor,
         old_policy_output: torch.Tensor,
-        old_log_std: torch.Tensor | None,
     ) -> torch.Tensor:
         new_policy_output = self.actor(states)
-        if self.action_type == "discrete":
-            old_dist = Categorical(logits=old_policy_output)
-            new_dist = Categorical(logits=new_policy_output)
-            return kl_divergence(old_dist, new_dist).mean()
-
-        if old_log_std is None or self.actor.log_std is None:
-            raise RuntimeError("Continuous TRPO KL requires log_std tensors")
-        old_std = old_log_std.exp().expand_as(old_policy_output)
-        new_std = self.actor.log_std.exp().expand_as(new_policy_output)
-        old_dist = Normal(old_policy_output, old_std)
-        new_dist = Normal(new_policy_output, new_std)
-        return kl_divergence(old_dist, new_dist).sum(dim=-1).mean()
+        old_dist = Categorical(logits=old_policy_output)
+        new_dist = Categorical(logits=new_policy_output)
+        return kl_divergence(old_dist, new_dist).mean()
 
     def _hessian_vector_product(
         self,
         states: torch.Tensor,
         old_policy_output: torch.Tensor,
-        old_log_std: torch.Tensor | None,
         vector: torch.Tensor,
     ) -> torch.Tensor:
-        kl = self._mean_kl(states, old_policy_output, old_log_std)
+        kl = self._mean_kl(states, old_policy_output)
         kl_grads = torch.autograd.grad(
             kl, self.actor.parameters(), create_graph=True, retain_graph=True
         )
@@ -401,7 +371,6 @@ class TRPOAgent(BaseAgent):
         old_log_probs: torch.Tensor,
         advantages: torch.Tensor,
         old_policy_output: torch.Tensor,
-        old_log_std: torch.Tensor | None,
         old_surrogate: torch.Tensor,
         full_step: torch.Tensor,
     ) -> tuple[bool, float, float]:
@@ -416,7 +385,7 @@ class TRPOAgent(BaseAgent):
                 surrogate = self._surrogate_loss(
                     states, actions, old_log_probs, advantages
                 )
-                kl = self._mean_kl(states, old_policy_output, old_log_std)
+                kl = self._mean_kl(states, old_policy_output)
 
             if torch.isfinite(surrogate) and torch.isfinite(kl):
                 if surrogate > old_surrogate and kl <= self.max_kl:
@@ -443,7 +412,9 @@ class TRPOAgent(BaseAgent):
     def load(self, filename: Pathish) -> bool:
         filename = os.fspath(filename)
         if os.path.isfile(filename):
-            checkpoint = torch.load(filename, weights_only=True)
+            checkpoint = torch.load(
+                filename, map_location=self.device, weights_only=True
+            )
             self.actor.load_state_dict(checkpoint["actor_state_dict"])
             self.critic.load_state_dict(checkpoint["critic_state_dict"])
             self.critic_optimizer.load_state_dict(

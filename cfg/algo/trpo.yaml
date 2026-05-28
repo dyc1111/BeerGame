@@ -7,7 +7,6 @@ agent:
   hidden_size: 64
   gamma: 0.99
   critic_lr: 0.001
-  action_type: discrete
   rollout_steps: 100
   gae_lambda: 0.95
   max_kl: 0.01
