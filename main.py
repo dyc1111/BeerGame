@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -23,8 +24,7 @@ TestResult = tuple[list[torch.Tensor], History, History, History, History]
 
 
 class OpponentPolicy(Protocol):
-    def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor:
-        ...
+    def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor: ...
 
 
 class RandomOrderPolicy:
@@ -33,9 +33,7 @@ class RandomOrderPolicy:
         self.device: torch.device = device
 
     def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor:
-        return torch.randint(
-            1, self.max_order + 1, (), device=self.device
-        ).float()
+        return torch.randint(1, self.max_order + 1, (), device=self.device).float()
 
 
 class ConstantOrderPolicy:
@@ -45,6 +43,36 @@ class ConstantOrderPolicy:
 
     def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor:
         return torch.tensor(self.order, dtype=torch.float32, device=self.device)
+
+
+class AgentObservationTransform:
+    def __init__(self, config: Any, device: torch.device) -> None:
+        self.enabled: bool = bool(config["train"].get("normalize_observations", True))
+        env_config = config["env"]
+        self.scale = torch.tensor(
+            [
+                max(float(env_config["max_order"]), 1.0),
+                max(float(env_config["max_order"]), 1.0),
+                max(float(env_config["initial_inventory"]), 1.0),
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+
+    def __call__(self, obs: torch.Tensor) -> torch.Tensor:
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.scale.device)
+        if not self.enabled:
+            return obs
+        return obs / self.scale
+
+
+def set_global_seed(seed: int | None) -> None:
+    if seed is None:
+        return
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def select_device(device_name: str = DEFAULT_DEVICE_NAME) -> torch.device:
@@ -58,7 +86,9 @@ def build_opponent_policy(config: Any, device: torch.device) -> OpponentPolicy:
     if policy_name == "random":
         return RandomOrderPolicy(config["env"]["max_order"], device)
     if policy_name == "constant":
-        return ConstantOrderPolicy(config["opponents"].get("constant_order", 10), device)
+        return ConstantOrderPolicy(
+            config["opponents"].get("constant_order", 10), device
+        )
     raise ValueError(f"Unknown opponent policy: {policy_name}")
 
 
@@ -105,13 +135,14 @@ def collect_actions(
     opponent_policy: OpponentPolicy,
     state: torch.Tensor,
     mode: str,
+    obs_transform: AgentObservationTransform,
 ) -> tuple[torch.Tensor, ActionResult]:
     actions = torch.zeros(env.num_firms, dtype=torch.float32, device=state.device)
     action_result: ActionResult | None = None
 
     for firm_id in range(env.num_firms):
         if firm_id == agent.firm_id:
-            action_result = agent.act(state[firm_id], mode=mode)
+            action_result = agent.act(obs_transform(state[firm_id]), mode=mode)
             actions[firm_id] = action_result.env_action
         else:
             actions[firm_id] = opponent_policy.act(state[firm_id], firm_id)
@@ -125,6 +156,7 @@ def train(
     env: Env,
     agent: BaseAgent,
     opponent_policy: OpponentPolicy,
+    obs_transform: AgentObservationTransform,
     train_config: Any,
     model_dir: Path,
 ) -> list[torch.Tensor]:
@@ -136,6 +168,7 @@ def train(
     max_t = train_config.get("max_t", env.max_steps)
     log_every = train_config.get("log_every", 100)
     checkpoint_every = train_config.get("checkpoint_every", 500)
+    reward_scale = float(train_config.get("reward_scale", 1.0))
     os.makedirs(model_dir, exist_ok=True)
 
     for i_episode in range(1, num_episodes + 1):
@@ -145,15 +178,20 @@ def train(
 
         for _ in range(max_t):
             actions, action_result = collect_actions(
-                env, agent, opponent_policy, state, mode="train"
+                env,
+                agent,
+                opponent_policy,
+                state,
+                mode="train",
+                obs_transform=obs_transform,
             )
             next_state, rewards, done = env.step(actions)
 
             transition = Transition(
-                obs=state[agent.firm_id],
+                obs=obs_transform(state[agent.firm_id]),
                 action=actions[agent.firm_id],
-                reward=rewards[agent.firm_id],
-                next_obs=next_state[agent.firm_id],
+                reward=rewards[agent.firm_id] * reward_scale,
+                next_obs=obs_transform(next_state[agent.firm_id]),
                 done=done,
                 raw_action=action_result.raw_action,
                 log_prob=action_result.log_prob,
@@ -216,6 +254,7 @@ def test(
     env: Env,
     agent: BaseAgent,
     opponent_policy: OpponentPolicy,
+    obs_transform: AgentObservationTransform,
     num_episodes: int = 10,
 ) -> TestResult:
     """
@@ -237,11 +276,18 @@ def test(
 
         for _ in range(env.max_steps):
             actions, _ = collect_actions(
-                env, agent, opponent_policy, state, mode="eval"
+                env,
+                agent,
+                opponent_policy,
+                state,
+                mode="eval",
+                obs_transform=obs_transform,
             )
             next_state, rewards, done = env.step(actions)
 
-            episode_inventory.append(env.inventory[agent.firm_id].detach().cpu().clone())
+            episode_inventory.append(
+                env.inventory[agent.firm_id].detach().cpu().clone()
+            )
             episode_orders.append(actions[agent.firm_id].detach().cpu().clone())
             episode_demand.append(env.demand[agent.firm_id].detach().cpu().clone())
             episode_satisfied_demand.append(
@@ -385,14 +431,18 @@ def plot_test_results(
 
 @hydra.main(config_path="cfg", config_name="base", version_base=None)
 def main(config: Any) -> None:
+    set_global_seed(config.get("seed"))
     device = select_device(DEFAULT_DEVICE_NAME)
     print(f"Using device: {device}")
     model_dir, figure_dir = build_output_dirs(config)
     env = build_env(config, device)
     agent = build_configured_agent(config, device)
     opponent_policy = build_opponent_policy(config, device)
+    obs_transform = AgentObservationTransform(config, device)
 
-    scores = train(env, agent, opponent_policy, config["train"], model_dir)
+    scores = train(
+        env, agent, opponent_policy, obs_transform, config["train"], model_dir
+    )
 
     plt.rcParams["axes.unicode_minus"] = False
     plot_training_results(scores, config["algo"]["name"], figure_dir)
@@ -407,6 +457,7 @@ def main(config: Any) -> None:
         env,
         agent,
         opponent_policy,
+        obs_transform,
         num_episodes=config["test"]["num_episodes"],
     )
 

@@ -3,6 +3,7 @@ defaults:
   - _self_
 
 exp: debug
+seed: 0
 
 env:
   num_firms: 10
@@ -18,6 +19,8 @@ train:
   num_episodes: 2000
   checkpoint_every: 500
   log_every: 100
+  normalize_observations: true
+  reward_scale: 0.01
 
 test:
   num_episodes: 10

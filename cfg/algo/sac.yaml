@@ -15,6 +15,6 @@ agent:
   update_every: 1
   gradient_steps: 1
   min_replay_size: 1000
-  alpha: 0.2
-  auto_entropy_tuning: true
+  alpha: 0.05
+  auto_entropy_tuning: false
   target_entropy: null

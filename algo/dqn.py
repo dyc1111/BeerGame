@@ -166,7 +166,7 @@ class DQNAgent(BaseAgent):
         self.target_network.load_state_dict(self.q_network.state_dict())
 
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
-        self.loss = nn.MSELoss()
+        self.loss = nn.SmoothL1Loss()
         self.memory = ReplayBuffer(buffer_size)
         self.t_step: int = 0
         self.pending_updates: int = 0
@@ -261,6 +261,7 @@ class DQNAgent(BaseAgent):
         loss = self.loss(Q_expected, Q_targets)
         self.optimizer.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_(self.q_network.parameters(), 10.0)
         self.optimizer.step()
 
         self.learning_step += 1
@@ -278,7 +279,10 @@ class DQNAgent(BaseAgent):
         next_states: torch.Tensor,
         dones: torch.Tensor,
     ) -> torch.Tensor:
-        Q_targets_next = torch.max(self.target_network(next_states), 1)[0].unsqueeze(1)
+        with torch.no_grad():
+            Q_targets_next = torch.max(self.target_network(next_states), 1)[0].unsqueeze(
+                1
+            )
         return rewards + (self.gamma * Q_targets_next * (1 - dones))
 
     def save(self, filename: Pathish) -> None:
@@ -327,8 +331,9 @@ class DoubleDQNAgent(DQNAgent):
         next_states: torch.Tensor,
         dones: torch.Tensor,
     ) -> torch.Tensor:
-        best_actions = torch.argmax(self.q_network(next_states), dim=1, keepdim=True)
-        next_q_values = self.target_network(next_states).gather(1, best_actions)
+        with torch.no_grad():
+            best_actions = torch.argmax(self.q_network(next_states), dim=1, keepdim=True)
+            next_q_values = self.target_network(next_states).gather(1, best_actions)
         return rewards + (self.gamma * next_q_values * (1 - dones))
 
 

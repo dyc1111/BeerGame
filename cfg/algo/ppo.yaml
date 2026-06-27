@@ -6,13 +6,13 @@ agent:
   action_size: 20
   hidden_size: 64
   gamma: 0.99
-  learning_rate: 0.0001
+  learning_rate: 0.001
   rollout_steps: 100
   minibatch_size: 64
-  ppo_epochs: 10
+  ppo_epochs: 4
   clip_coef: 0.2
-  value_coef: 1.0
-  entropy_coef: 0
+  value_coef: 0.5
+  entropy_coef: 0.01
   gae_lambda: 0.95
   max_grad_norm: 0.5
   normalize_advantages: true
