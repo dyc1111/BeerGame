@@ -4,6 +4,7 @@ defaults:
 
 exp: debug
 seed: 0
+execution_mode: single_agent
 
 env:
   num_firms: 10
@@ -28,6 +29,9 @@ test:
 opponents:
   policy: random
   constant_order: 10
+
+multi_agent:
+  firm_ids: [0, 4, 8]
 
 output:
   model_root: models

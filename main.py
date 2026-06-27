@@ -1,432 +1,30 @@
 from __future__ import annotations
 
 import os
-import random
-from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import hydra
 import matplotlib.pyplot as plt
-import torch
-from hydra.utils import to_absolute_path
-from omegaconf import OmegaConf
 
-from algo import build_agent
-from algo.base import ActionResult, BaseAgent, Transition
-from env import Env
-
-DEFAULT_DEVICE_NAME = "cuda:0"
-
-History = list[list[torch.Tensor]]
-TestResult = tuple[list[torch.Tensor], History, History, History, History]
-
-
-class OpponentPolicy(Protocol):
-    def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor: ...
-
-
-class RandomOrderPolicy:
-    def __init__(self, max_order: int, device: torch.device) -> None:
-        self.max_order: int = max_order
-        self.device: torch.device = device
-
-    def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor:
-        return torch.randint(1, self.max_order + 1, (), device=self.device).float()
-
-
-class ConstantOrderPolicy:
-    def __init__(self, order: float, device: torch.device) -> None:
-        self.order: float = float(order)
-        self.device: torch.device = device
-
-    def act(self, obs: torch.Tensor, firm_id: int) -> torch.Tensor:
-        return torch.tensor(self.order, dtype=torch.float32, device=self.device)
-
-
-class AgentObservationTransform:
-    def __init__(self, config: Any, device: torch.device) -> None:
-        self.enabled: bool = bool(config["train"].get("normalize_observations", True))
-        env_config = config["env"]
-        self.scale = torch.tensor(
-            [
-                max(float(env_config["max_order"]), 1.0),
-                max(float(env_config["max_order"]), 1.0),
-                max(float(env_config["initial_inventory"]), 1.0),
-            ],
-            dtype=torch.float32,
-            device=device,
-        )
-
-    def __call__(self, obs: torch.Tensor) -> torch.Tensor:
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.scale.device)
-        if not self.enabled:
-            return obs
-        return obs / self.scale
-
-
-def set_global_seed(seed: int | None) -> None:
-    if seed is None:
-        return
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def select_device(device_name: str = DEFAULT_DEVICE_NAME) -> torch.device:
-    if device_name.startswith("cuda") and torch.cuda.is_available():
-        return torch.device(device_name)
-    return torch.device("cpu")
-
-
-def build_opponent_policy(config: Any, device: torch.device) -> OpponentPolicy:
-    policy_name = config["opponents"].get("policy", "random")
-    if policy_name == "random":
-        return RandomOrderPolicy(config["env"]["max_order"], device)
-    if policy_name == "constant":
-        return ConstantOrderPolicy(
-            config["opponents"].get("constant_order", 10), device
-        )
-    raise ValueError(f"Unknown opponent policy: {policy_name}")
-
-
-def build_env(config: Any, device: torch.device) -> Env:
-    env_config = config["env"]
-    return Env(
-        env_config["num_firms"],
-        list(env_config["p"]),
-        env_config["h"],
-        env_config["c"],
-        env_config["initial_inventory"],
-        env_config["poisson_lambda"],
-        env_config["max_steps"],
-        device=device,
-    )
-
-
-def build_configured_agent(config: Any, device: torch.device) -> BaseAgent:
-    env_config = config["env"]
-    algo_config = config["algo"]
-    agent_config = {
-        **OmegaConf.to_container(algo_config["agent"], resolve=True),
-        "max_order": env_config["max_order"],
-        "device": device,
-    }
-    return build_agent(algo_config["name"], **agent_config)
-
-
-def build_output_dirs(config: Any) -> tuple[Path, Path]:
-    algo_name = config["algo"]["name"]
-    exp = str(config.get("exp", "debug"))
-    model_root = config["output"].get("model_root", "models")
-    figure_root = config["output"].get("figure_root", "figures")
-    model_dir = Path(to_absolute_path(os.path.join(model_root, algo_name, exp)))
-    figure_dir = Path(to_absolute_path(os.path.join(figure_root, algo_name, exp)))
-    model_dir.mkdir(parents=True, exist_ok=True)
-    figure_dir.mkdir(parents=True, exist_ok=True)
-    return model_dir, figure_dir
-
-
-def collect_actions(
-    env: Env,
-    agent: BaseAgent,
-    opponent_policy: OpponentPolicy,
-    state: torch.Tensor,
-    mode: str,
-    obs_transform: AgentObservationTransform,
-) -> tuple[torch.Tensor, ActionResult]:
-    actions = torch.zeros(env.num_firms, dtype=torch.float32, device=state.device)
-    action_result: ActionResult | None = None
-
-    for firm_id in range(env.num_firms):
-        if firm_id == agent.firm_id:
-            action_result = agent.act(obs_transform(state[firm_id]), mode=mode)
-            actions[firm_id] = action_result.env_action
-        else:
-            actions[firm_id] = opponent_policy.act(state[firm_id], firm_id)
-
-    if action_result is None:
-        raise RuntimeError(f"No action was collected for firm_id={agent.firm_id}")
-    return actions, action_result
-
-
-def train(
-    env: Env,
-    agent: BaseAgent,
-    opponent_policy: OpponentPolicy,
-    obs_transform: AgentObservationTransform,
-    train_config: Any,
-    model_dir: Path,
-) -> list[torch.Tensor]:
-    """
-    Train any agent that implements the BaseAgent API.
-    """
-    scores: list[torch.Tensor] = []
-    num_episodes = train_config.get("num_episodes", 1000)
-    max_t = train_config.get("max_t", env.max_steps)
-    log_every = train_config.get("log_every", 100)
-    checkpoint_every = train_config.get("checkpoint_every", 500)
-    reward_scale = float(train_config.get("reward_scale", 1.0))
-    os.makedirs(model_dir, exist_ok=True)
-
-    for i_episode in range(1, num_episodes + 1):
-        state = env.reset()
-        score = torch.tensor(0.0, device=env.device)
-        last_update_metrics: dict[str, float] = {}
-
-        for _ in range(max_t):
-            actions, action_result = collect_actions(
-                env,
-                agent,
-                opponent_policy,
-                state,
-                mode="train",
-                obs_transform=obs_transform,
-            )
-            next_state, rewards, done = env.step(actions)
-
-            transition = Transition(
-                obs=obs_transform(state[agent.firm_id]),
-                action=actions[agent.firm_id],
-                reward=rewards[agent.firm_id] * reward_scale,
-                next_obs=obs_transform(next_state[agent.firm_id]),
-                done=done,
-                raw_action=action_result.raw_action,
-                log_prob=action_result.log_prob,
-                value=action_result.value,
-            )
-            agent.observe(transition)
-
-            update_guard = 0
-            while agent.ready_to_update():
-                last_update_metrics = agent.update()
-                update_guard += 1
-                if update_guard > 1000:
-                    raise RuntimeError(
-                        f"{agent.algo_name}.update() did not clear update readiness"
-                    )
-
-            state = next_state
-            score += rewards[agent.firm_id]
-
-            if done:
-                break
-
-        agent.on_episode_end()
-        while agent.ready_to_update():
-            last_update_metrics = agent.update()
-        scores.append(score.detach().clone())
-
-        if i_episode % log_every == 0:
-            average_score = torch.stack(scores[-log_every:]).mean().item()
-            metric_text = ""
-            if last_update_metrics:
-                metric_text = " | " + " | ".join(
-                    f"{name}: {value:.4f}"
-                    for name, value in last_update_metrics.items()
-                    if isinstance(value, (int, float))
-                )
-            print(
-                f"Episode {i_episode}/{num_episodes} | "
-                f"Average Score: {average_score:.2f}{metric_text}"
-            )
-
-        if i_episode % checkpoint_every == 0:
-            agent.save(
-                os.path.join(
-                    model_dir,
-                    f"{agent.algo_name}_agent_firm_{agent.firm_id}_episode_{i_episode}.pth",
-                )
-            )
-
-    agent.save(
-        os.path.join(
-            model_dir, f"{agent.algo_name}_agent_firm_{agent.firm_id}_final.pth"
-        )
-    )
-
-    return scores
-
-
-def test(
-    env: Env,
-    agent: BaseAgent,
-    opponent_policy: OpponentPolicy,
-    obs_transform: AgentObservationTransform,
-    num_episodes: int = 10,
-) -> TestResult:
-    """
-    Test any trained agent that implements the BaseAgent API.
-    """
-    scores: list[torch.Tensor] = []
-    inventory_history: History = []
-    orders_history: History = []
-    demand_history: History = []
-    satisfied_demand_history: History = []
-
-    for i_episode in range(1, num_episodes + 1):
-        state = env.reset()
-        score = torch.tensor(0.0, device=env.device)
-        episode_inventory: list[torch.Tensor] = []
-        episode_orders: list[torch.Tensor] = []
-        episode_demand: list[torch.Tensor] = []
-        episode_satisfied_demand: list[torch.Tensor] = []
-
-        for _ in range(env.max_steps):
-            actions, _ = collect_actions(
-                env,
-                agent,
-                opponent_policy,
-                state,
-                mode="eval",
-                obs_transform=obs_transform,
-            )
-            next_state, rewards, done = env.step(actions)
-
-            episode_inventory.append(
-                env.inventory[agent.firm_id].detach().cpu().clone()
-            )
-            episode_orders.append(actions[agent.firm_id].detach().cpu().clone())
-            episode_demand.append(env.demand[agent.firm_id].detach().cpu().clone())
-            episode_satisfied_demand.append(
-                env.satisfied_demand[agent.firm_id].detach().cpu().clone()
-            )
-
-            score = score + rewards[agent.firm_id]
-            state = next_state
-
-            if done:
-                break
-
-        scores.append(score.detach().clone())
-        inventory_history.append(episode_inventory)
-        orders_history.append(episode_orders)
-        demand_history.append(episode_demand)
-        satisfied_demand_history.append(episode_satisfied_demand)
-
-        print(f"Test Episode {i_episode}/{num_episodes} | Score: {score.item():.2f}")
-
-    return (
-        scores,
-        inventory_history,
-        orders_history,
-        demand_history,
-        satisfied_demand_history,
-    )
-
-
-def plot_training_results(
-    scores: list[torch.Tensor],
-    algo_name: str,
-    figure_dir: Path,
-    window_size: int = 100,
-) -> None:
-    """
-    Plot training rewards.
-    """
-
-    score_tensor = torch.stack(
-        [
-            torch.as_tensor(score, dtype=torch.float32).detach().cpu().reshape(())
-            for score in scores
-        ]
-    )
-
-    def moving_average(data: torch.Tensor, window_size: int) -> torch.Tensor:
-        return torch.stack(
-            [data[max(0, i - window_size) : i + 1].mean() for i in range(len(data))]
-        )
-
-    avg_scores = moving_average(score_tensor, window_size)
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(
-        torch.arange(len(score_tensor)),
-        score_tensor,
-        alpha=0.3,
-        label="Raw Reward",
-    )
-    plt.plot(
-        torch.arange(len(avg_scores)),
-        avg_scores,
-        label=f"{window_size}-Episode Moving Average",
-    )
-    plt.title(f"{algo_name.upper()} Training Rewards")
-    plt.xlabel("Episode")
-    plt.ylabel("Reward")
-    plt.legend()
-    plt.savefig(os.path.join(figure_dir, "training_rewards.png"))
-    plt.close()
-
-
-def plot_test_results(
-    scores: list[torch.Tensor],
-    inventory_history: History,
-    orders_history: History,
-    demand_history: History,
-    satisfied_demand_history: History,
-    figure_dir: Path,
-) -> None:
-    """
-    Plot test results.
-    """
-
-    def history_to_tensor(history: History) -> torch.Tensor:
-        return torch.stack(
-            [
-                torch.stack(
-                    [
-                        torch.as_tensor(value, dtype=torch.float32)
-                        .detach()
-                        .cpu()
-                        .reshape(())
-                        for value in episode
-                    ]
-                )
-                for episode in history
-            ]
-        )
-
-    avg_inventory = history_to_tensor(inventory_history).mean(dim=0)
-    avg_orders = history_to_tensor(orders_history).mean(dim=0)
-    avg_demand = history_to_tensor(demand_history).mean(dim=0)
-    avg_satisfied_demand = history_to_tensor(satisfied_demand_history).mean(dim=0)
-    score_tensor = torch.stack(
-        [
-            torch.as_tensor(score, dtype=torch.float32).detach().cpu().reshape(())
-            for score in scores
-        ]
-    )
-
-    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-
-    axs[0, 0].plot(avg_inventory)
-    axs[0, 0].set_title("Average Inventory")
-    axs[0, 0].set_xlabel("Time Step")
-    axs[0, 0].set_ylabel("Inventory")
-
-    axs[0, 1].plot(avg_orders)
-    axs[0, 1].set_title("Average Order Quantity")
-    axs[0, 1].set_xlabel("Time Step")
-    axs[0, 1].set_ylabel("Order Quantity")
-
-    axs[1, 0].plot(avg_demand, label="Demand")
-    axs[1, 0].plot(avg_satisfied_demand, label="Satisfied Demand")
-    axs[1, 0].set_title("Average Demand vs. Satisfied Demand")
-    axs[1, 0].set_xlabel("Time Step")
-    axs[1, 0].set_ylabel("Quantity")
-    axs[1, 0].legend()
-
-    axs[1, 1].bar(torch.arange(len(score_tensor)), score_tensor)
-    axs[1, 1].set_title("Test Episode Rewards")
-    axs[1, 1].set_xlabel("Episode")
-    axs[1, 1].set_ylabel("Total Reward")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(figure_dir, "test_results.png"))
-    plt.close()
+from experiment import (
+    DEFAULT_DEVICE_NAME,
+    build_configured_agent,
+    build_configured_agents,
+    build_env,
+    build_output_dirs,
+    select_device,
+    set_global_seed,
+)
+from plotting import (
+    plot_multi_agent_test_results,
+    plot_multi_agent_training_results,
+    plot_test_results,
+    plot_training_results,
+)
+from policies import AgentObservationTransform, build_opponent_policy
+from training import test, test_independent_agents, train, train_independent_agents
 
 
 @hydra.main(config_path="cfg", config_name="base", version_base=None)
@@ -436,9 +34,50 @@ def main(config: Any) -> None:
     print(f"Using device: {device}")
     model_dir, figure_dir = build_output_dirs(config)
     env = build_env(config, device)
-    agent = build_configured_agent(config, device)
     opponent_policy = build_opponent_policy(config, device)
     obs_transform = AgentObservationTransform(config, device)
+    execution_mode = config.get("execution_mode", "single_agent")
+
+    if execution_mode == "independent_multi_agent":
+        agents = build_configured_agents(config, device)
+        print(
+            "Training independent learners for firms: "
+            + ", ".join(str(agent.firm_id) for agent in agents)
+        )
+        scores_by_firm = train_independent_agents(
+            env, agents, opponent_policy, obs_transform, config["train"], model_dir
+        )
+
+        plt.rcParams["axes.unicode_minus"] = False
+        plot_multi_agent_training_results(
+            scores_by_firm, config["algo"]["name"], figure_dir
+        )
+
+        (
+            test_scores_by_firm,
+            _inventory_history,
+            orders_history,
+            _demand_history,
+            _satisfied_demand_history,
+        ) = test_independent_agents(
+            env,
+            agents,
+            opponent_policy,
+            obs_transform,
+            num_episodes=config["test"]["num_episodes"],
+        )
+
+        plot_multi_agent_test_results(
+            test_scores_by_firm,
+            orders_history,
+            figure_dir,
+        )
+        return
+
+    if execution_mode != "single_agent":
+        raise ValueError(f"Unknown execution_mode: {execution_mode}")
+
+    agent = build_configured_agent(config, device)
 
     scores = train(
         env, agent, opponent_policy, obs_transform, config["train"], model_dir
