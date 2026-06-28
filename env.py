@@ -55,8 +55,12 @@ class Env:
             dtype=torch.float32,
             device=self.device,
         )
-        self.orders = torch.zeros(self.num_firms, dtype=torch.float32, device=self.device)
-        self.demand = torch.zeros(self.num_firms, dtype=torch.float32, device=self.device)
+        self.orders = torch.zeros(
+            self.num_firms, dtype=torch.float32, device=self.device
+        )
+        self.demand = torch.zeros(
+            self.num_firms, dtype=torch.float32, device=self.device
+        )
         self.satisfied_demand = torch.zeros(
             self.num_firms, dtype=torch.float32, device=self.device
         )

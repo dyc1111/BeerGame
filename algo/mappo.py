@@ -124,52 +124,38 @@ class MAPPO:
         self.max_grad_norm = max_grad_norm
         self.normalize_advantages = normalize_advantages
         self.device = torch.device(device)
+        self.firm_feature_size = 1
 
-        self.actors = nn.ModuleDict(
-            {
-                str(firm_id): PolicyNetwork(state_size, action_size, hidden_size)
-                for firm_id in self.firm_ids
-            }
+        self.actor = PolicyNetwork(
+            state_size + self.firm_feature_size, action_size, hidden_size
         ).to(self.device)
-        self.critics = nn.ModuleDict(
-            {
-                str(firm_id): CentralizedValueNetwork(
-                    self.global_state_size, critic_hidden_size
-                )
-                for firm_id in self.firm_ids
-            }
+        self.critic = CentralizedValueNetwork(
+            self.global_state_size + self.firm_feature_size, critic_hidden_size
         ).to(self.device)
 
-        self.actor_optimizers = {
-            firm_id: optim.Adam(self.actors[str(firm_id)].parameters(), lr=actor_lr)
-            for firm_id in self.firm_ids
-        }
-        self.critic_optimizers = {
-            firm_id: optim.Adam(self.critics[str(firm_id)].parameters(), lr=critic_lr)
-            for firm_id in self.firm_ids
-        }
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.rollouts = {firm_id: MAPPORolloutBuffer() for firm_id in self.firm_ids}
 
         if initial_order is not None and initial_order_bias != 0.0:
             action_index = int(initial_order) - 1
             if action_index < 0 or action_index >= action_size:
                 raise ValueError("initial_order must be in the action space")
-            for actor in self.actors.values():
-                actor.add_action_bias(action_index, float(initial_order_bias))
+            self.actor.add_action_bias(action_index, float(initial_order_bias))
 
     def has_firm(self, firm_id: int) -> bool:
         return int(firm_id) in self.rollouts
 
     def act(self, firm_id: int, obs: Any, mode: str = "train") -> ActionResult:
-        actor = self.actors[str(int(firm_id))]
         obs = (
             torch.as_tensor(obs, dtype=torch.float32, device=self.device)
             .flatten()
             .unsqueeze(0)
         )
+        actor_input = self._append_firm_feature(obs, firm_id)
 
         with torch.no_grad():
-            distribution = actor.distribution(obs)
+            distribution = self.actor.distribution(actor_input)
             if mode == "train":
                 raw_action = distribution.sample()
             else:
@@ -209,7 +195,9 @@ class MAPPO:
         )
 
     def ready_to_update(self) -> bool:
-        return all(len(buffer) >= self.rollout_steps for buffer in self.rollouts.values())
+        return all(
+            len(buffer) >= self.rollout_steps for buffer in self.rollouts.values()
+        )
 
     def has_rollout_data(self) -> bool:
         return any(len(buffer) > 0 for buffer in self.rollouts.values())
@@ -218,29 +206,52 @@ class MAPPO:
         if not force and not self.ready_to_update():
             return {}
 
-        metrics_by_firm: dict[int, dict[str, float]] = {}
+        batches: list[TensorBatch] = []
         for firm_id in self.firm_ids:
             if len(self.rollouts[firm_id]) == 0:
                 continue
-            batch = self._build_batch(firm_id)
-            metrics_by_firm[firm_id] = self._update_firm(firm_id, batch)
+            batches.append(self._build_batch(firm_id))
             self.rollouts[firm_id].clear()
 
-        return self._average_metrics(metrics_by_firm)
+        if not batches:
+            return {}
+        return self._update_shared(self._merge_batches(batches))
+
+    def _firm_feature_value(self, firm_id: int) -> float:
+        if self.num_firms <= 1:
+            return 0.0
+        return float(firm_id) / float(self.num_firms - 1)
+
+    def _firm_features(self, firm_id: int, batch_size: int) -> torch.Tensor:
+        value = self._firm_feature_value(firm_id)
+        return torch.full(
+            (batch_size, self.firm_feature_size),
+            value,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    def _append_firm_feature(self, inputs: torch.Tensor, firm_id: int) -> torch.Tensor:
+        inputs = torch.as_tensor(inputs, dtype=torch.float32, device=self.device)
+        if inputs.dim() == 1:
+            inputs = inputs.unsqueeze(0)
+        return torch.cat([inputs, self._firm_features(firm_id, inputs.shape[0])], dim=1)
 
     def _build_batch(self, firm_id: int) -> TensorBatch:
         transitions = self.rollouts[firm_id].transitions
         local_obs = torch.stack(
             [
-                torch.as_tensor(t.local_obs, dtype=torch.float32, device=self.device)
-                .flatten()
+                torch.as_tensor(
+                    t.local_obs, dtype=torch.float32, device=self.device
+                ).flatten()
                 for t in transitions
             ]
         )
         global_obs = torch.stack(
             [
-                torch.as_tensor(t.global_obs, dtype=torch.float32, device=self.device)
-                .flatten()
+                torch.as_tensor(
+                    t.global_obs, dtype=torch.float32, device=self.device
+                ).flatten()
                 for t in transitions
             ]
         )
@@ -262,9 +273,9 @@ class MAPPO:
         )
         rewards = torch.stack(
             [
-                torch.as_tensor(t.reward, dtype=torch.float32, device=self.device).reshape(
-                    ()
-                )
+                torch.as_tensor(
+                    t.reward, dtype=torch.float32, device=self.device
+                ).reshape(())
                 for t in transitions
             ]
         )
@@ -273,17 +284,18 @@ class MAPPO:
         )
         old_log_probs = torch.stack(
             [
-                torch.as_tensor(t.log_prob, dtype=torch.float32, device=self.device).reshape(
-                    ()
-                )
+                torch.as_tensor(
+                    t.log_prob, dtype=torch.float32, device=self.device
+                ).reshape(())
                 for t in transitions
             ]
         )
 
-        critic = self.critics[str(firm_id)]
+        critic_obs = self._append_firm_feature(global_obs, firm_id)
+        next_critic_obs = self._append_firm_feature(next_global_obs, firm_id)
         with torch.no_grad():
-            values = critic(global_obs)
-            next_values = critic(next_global_obs)
+            values = self.critic(critic_obs)
+            next_values = self.critic(next_critic_obs)
 
         advantages = torch.zeros_like(rewards, device=self.device)
         gae = torch.tensor(0.0, device=self.device)
@@ -302,20 +314,21 @@ class MAPPO:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         return {
-            "local_obs": local_obs,
-            "global_obs": global_obs,
+            "local_obs": self._append_firm_feature(local_obs, firm_id),
+            "global_obs": critic_obs,
             "actions": actions,
             "old_log_probs": old_log_probs,
             "advantages": advantages.detach(),
             "returns": returns.detach(),
         }
 
-    def _update_firm(self, firm_id: int, batch: TensorBatch) -> dict[str, float]:
-        actor = self.actors[str(firm_id)]
-        critic = self.critics[str(firm_id)]
-        actor_optimizer = self.actor_optimizers[firm_id]
-        critic_optimizer = self.critic_optimizers[firm_id]
+    def _merge_batches(self, batches: list[TensorBatch]) -> TensorBatch:
+        keys = batches[0].keys()
+        return {
+            key: torch.cat([batch[key] for batch in batches], dim=0) for key in keys
+        }
 
+    def _update_shared(self, batch: TensorBatch) -> dict[str, float]:
         losses: list[float] = []
         policy_losses: list[float] = []
         value_losses: list[float] = []
@@ -328,14 +341,7 @@ class MAPPO:
             indices = torch.randperm(batch_size, device=self.device)
             for start in range(0, batch_size, minibatch_size):
                 mb_idx = indices[start : start + minibatch_size]
-                metrics = self._update_minibatch(
-                    actor,
-                    critic,
-                    actor_optimizer,
-                    critic_optimizer,
-                    batch,
-                    mb_idx,
-                )
+                metrics = self._update_minibatch(batch, mb_idx)
                 losses.append(metrics["loss"])
                 policy_losses.append(metrics["policy_loss"])
                 value_losses.append(metrics["value_loss"])
@@ -350,10 +356,6 @@ class MAPPO:
 
     def _update_minibatch(
         self,
-        actor: PolicyNetwork,
-        critic: CentralizedValueNetwork,
-        actor_optimizer: optim.Optimizer,
-        critic_optimizer: optim.Optimizer,
         batch: TensorBatch,
         indices: torch.Tensor,
     ) -> dict[str, float]:
@@ -364,7 +366,7 @@ class MAPPO:
         advantages = batch["advantages"][indices]
         returns = batch["returns"][indices]
 
-        distribution = actor.distribution(local_obs)
+        distribution = self.actor.distribution(local_obs)
         log_probs = distribution.log_prob(actions)
         entropy = distribution.entropy().mean()
         ratio = torch.exp(log_probs - old_log_probs)
@@ -374,20 +376,16 @@ class MAPPO:
             ratio, 1.0 - self.clip_coef, 1.0 + self.clip_coef
         )
         policy_loss = torch.max(unclipped_policy_loss, clipped_policy_loss).mean()
-        value_loss = nn.functional.mse_loss(critic(global_obs), returns)
-        loss = (
-            policy_loss
-            + self.value_coef * value_loss
-            - self.entropy_coef * entropy
-        )
+        value_loss = nn.functional.mse_loss(self.critic(global_obs), returns)
+        loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
 
-        actor_optimizer.zero_grad()
-        critic_optimizer.zero_grad()
+        self.actor_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(actor.parameters(), self.max_grad_norm)
-        nn.utils.clip_grad_norm_(critic.parameters(), self.max_grad_norm)
-        actor_optimizer.step()
-        critic_optimizer.step()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+        self.actor_optimizer.step()
+        self.critic_optimizer.step()
 
         return {
             "loss": loss.item(),
@@ -404,16 +402,10 @@ class MAPPO:
         torch.save(
             {
                 "firm_ids": self.firm_ids,
-                "actors_state_dict": self.actors.state_dict(),
-                "critics_state_dict": self.critics.state_dict(),
-                "actor_optimizer_state_dicts": {
-                    firm_id: optimizer.state_dict()
-                    for firm_id, optimizer in self.actor_optimizers.items()
-                },
-                "critic_optimizer_state_dicts": {
-                    firm_id: optimizer.state_dict()
-                    for firm_id, optimizer in self.critic_optimizers.items()
-                },
+                "actor_state_dict": self.actor.state_dict(),
+                "critic_state_dict": self.critic.state_dict(),
+                "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
+                "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
             },
             filename,
         )
@@ -424,12 +416,10 @@ class MAPPO:
         if not os.path.isfile(filename):
             return False
         checkpoint = torch.load(filename, weights_only=True, map_location=self.device)
-        self.actors.load_state_dict(checkpoint["actors_state_dict"])
-        self.critics.load_state_dict(checkpoint["critics_state_dict"])
-        for firm_id, state_dict in checkpoint["actor_optimizer_state_dicts"].items():
-            self.actor_optimizers[int(firm_id)].load_state_dict(state_dict)
-        for firm_id, state_dict in checkpoint["critic_optimizer_state_dicts"].items():
-            self.critic_optimizers[int(firm_id)].load_state_dict(state_dict)
+        self.actor.load_state_dict(checkpoint["actor_state_dict"])
+        self.critic.load_state_dict(checkpoint["critic_state_dict"])
+        self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
+        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state_dict"])
         print(f"Loaded model from {filename}")
         return True
 

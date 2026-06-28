@@ -339,9 +339,7 @@ def collect_mappo_actions(
 
     for firm_id in range(env.num_firms):
         if mappo.has_firm(firm_id):
-            action_result = mappo.act(
-                firm_id, obs_transform(state[firm_id]), mode=mode
-            )
+            action_result = mappo.act(firm_id, obs_transform(state[firm_id]), mode=mode)
             actions[firm_id] = action_result.env_action
             action_results[firm_id] = action_result
         else:
@@ -359,7 +357,7 @@ def train_mappo(
     model_dir: Path,
 ) -> AgentScores:
     """
-    Train MAPPO with decentralized actors and centralized per-firm critics.
+    Train shared-parameter MAPPO with decentralized actors and a centralized critic.
     """
     scores_by_firm: AgentScores = {firm_id: [] for firm_id in mappo.firm_ids}
     num_episodes = train_config.get("num_episodes", 1000)
@@ -429,7 +427,9 @@ def train_mappo(
             )
 
         if i_episode % checkpoint_every == 0:
-            mappo.save(os.path.join(model_dir, f"{mappo.algo_name}_episode_{i_episode}.pth"))
+            mappo.save(
+                os.path.join(model_dir, f"{mappo.algo_name}_episode_{i_episode}.pth")
+            )
 
     if mappo.has_rollout_data():
         last_update_metrics = mappo.update(force=True)
@@ -522,9 +522,7 @@ def test_independent_agents(
     inventory_history: AgentHistories = {agent.firm_id: [] for agent in agents}
     orders_history: AgentHistories = {agent.firm_id: [] for agent in agents}
     demand_history: AgentHistories = {agent.firm_id: [] for agent in agents}
-    satisfied_demand_history: AgentHistories = {
-        agent.firm_id: [] for agent in agents
-    }
+    satisfied_demand_history: AgentHistories = {agent.firm_id: [] for agent in agents}
 
     for i_episode in range(1, num_episodes + 1):
         state = env.reset()
@@ -555,7 +553,9 @@ def test_independent_agents(
                     env.inventory[firm_id].detach().cpu().clone()
                 )
                 episode_orders[firm_id].append(actions[firm_id].detach().cpu().clone())
-                episode_demand[firm_id].append(env.demand[firm_id].detach().cpu().clone())
+                episode_demand[firm_id].append(
+                    env.demand[firm_id].detach().cpu().clone()
+                )
                 episode_satisfied_demand[firm_id].append(
                     env.satisfied_demand[firm_id].detach().cpu().clone()
                 )
@@ -571,9 +571,7 @@ def test_independent_agents(
             inventory_history[firm_id].append(episode_inventory[firm_id])
             orders_history[firm_id].append(episode_orders[firm_id])
             demand_history[firm_id].append(episode_demand[firm_id])
-            satisfied_demand_history[firm_id].append(
-                episode_satisfied_demand[firm_id]
-            )
+            satisfied_demand_history[firm_id].append(episode_satisfied_demand[firm_id])
 
         mean_score = torch.stack(list(episode_scores.values())).mean().item()
         print(
@@ -636,7 +634,9 @@ def test_mappo(
                     env.inventory[firm_id].detach().cpu().clone()
                 )
                 episode_orders[firm_id].append(actions[firm_id].detach().cpu().clone())
-                episode_demand[firm_id].append(env.demand[firm_id].detach().cpu().clone())
+                episode_demand[firm_id].append(
+                    env.demand[firm_id].detach().cpu().clone()
+                )
                 episode_satisfied_demand[firm_id].append(
                     env.satisfied_demand[firm_id].detach().cpu().clone()
                 )
@@ -651,9 +651,7 @@ def test_mappo(
             inventory_history[firm_id].append(episode_inventory[firm_id])
             orders_history[firm_id].append(episode_orders[firm_id])
             demand_history[firm_id].append(episode_demand[firm_id])
-            satisfied_demand_history[firm_id].append(
-                episode_satisfied_demand[firm_id]
-            )
+            satisfied_demand_history[firm_id].append(episode_satisfied_demand[firm_id])
 
         mean_score = torch.stack(list(episode_scores.values())).mean().item()
         print(

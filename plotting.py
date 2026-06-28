@@ -83,9 +83,9 @@ def plot_multi_agent_training_results(
     score_tensors = {
         firm_id: _score_tensor(scores_by_firm[firm_id]) for firm_id in firm_ids
     }
-    mean_scores = torch.stack(
-        [score_tensors[firm_id] for firm_id in firm_ids]
-    ).mean(dim=0)
+    mean_scores = torch.stack([score_tensors[firm_id] for firm_id in firm_ids]).mean(
+        dim=0
+    )
 
     plt.figure(figsize=(12, 7))
     for firm_id in firm_ids:

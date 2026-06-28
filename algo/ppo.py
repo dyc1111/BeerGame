@@ -181,7 +181,9 @@ class PPOAgent(BaseAgent):
         transitions = self.rollout.transitions
         states = torch.stack(
             [
-                torch.as_tensor(t.obs, dtype=torch.float32, device=self.device).flatten()
+                torch.as_tensor(
+                    t.obs, dtype=torch.float32, device=self.device
+                ).flatten()
                 for t in transitions
             ]
         )
@@ -222,12 +224,12 @@ class PPOAgent(BaseAgent):
         gae = torch.tensor(0.0, device=self.device)
         for step in reversed(range(len(transitions))):
             next_value = (
-                next_values[step]
-                if step == len(transitions) - 1
-                else values[step + 1]
+                next_values[step] if step == len(transitions) - 1 else values[step + 1]
             )
             non_terminal = 1.0 - dones[step]
-            delta = rewards[step] + self.gamma * next_value * non_terminal - values[step]
+            delta = (
+                rewards[step] + self.gamma * next_value * non_terminal - values[step]
+            )
             gae = delta + self.gamma * self.gae_lambda * non_terminal * gae
             advantages[step] = gae
 
@@ -307,7 +309,9 @@ class PPOAgent(BaseAgent):
     def load(self, filename: Pathish) -> bool:
         filename = os.fspath(filename)
         if os.path.isfile(filename):
-            checkpoint = torch.load(filename, weights_only=True, map_location=self.device)
+            checkpoint = torch.load(
+                filename, weights_only=True, map_location=self.device
+            )
             self.network.load_state_dict(checkpoint["network_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             print(f"Loaded model from {filename}")

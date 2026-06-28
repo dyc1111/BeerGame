@@ -211,7 +211,9 @@ class DQNAgent(BaseAgent):
         :param mode: "train" enables epsilon-greedy exploration, "eval" is greedy
         :return: Selected action
         """
-        state = torch.as_tensor(state, dtype=torch.float32, device=self.device).flatten()
+        state = torch.as_tensor(
+            state, dtype=torch.float32, device=self.device
+        ).flatten()
 
         self.q_network.eval()
         with torch.no_grad():
@@ -254,7 +256,9 @@ class DQNAgent(BaseAgent):
         actions = torch.stack(actions).long().to(self.device).unsqueeze(1) - 1
         rewards = torch.stack(rewards).float().to(self.device).unsqueeze(1)
         next_states = torch.stack(next_states).float().to(self.device)
-        dones = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
+        dones = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(
+            1
+        )
 
         Q_targets = self._compute_q_targets(rewards, next_states, dones)
         Q_expected = torch.gather(self.q_network(states), 1, actions)
@@ -280,9 +284,9 @@ class DQNAgent(BaseAgent):
         dones: torch.Tensor,
     ) -> torch.Tensor:
         with torch.no_grad():
-            Q_targets_next = torch.max(self.target_network(next_states), 1)[0].unsqueeze(
-                1
-            )
+            Q_targets_next = torch.max(self.target_network(next_states), 1)[
+                0
+            ].unsqueeze(1)
         return rewards + (self.gamma * Q_targets_next * (1 - dones))
 
     def save(self, filename: Pathish) -> None:
@@ -313,7 +317,9 @@ class DQNAgent(BaseAgent):
         """
         filename = os.fspath(filename)
         if os.path.isfile(filename):
-            checkpoint = torch.load(filename, weights_only=True, map_location=self.device)
+            checkpoint = torch.load(
+                filename, weights_only=True, map_location=self.device
+            )
             self.q_network.load_state_dict(checkpoint["q_network_state_dict"])
             self.target_network.load_state_dict(checkpoint["target_network_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -332,7 +338,9 @@ class DoubleDQNAgent(DQNAgent):
         dones: torch.Tensor,
     ) -> torch.Tensor:
         with torch.no_grad():
-            best_actions = torch.argmax(self.q_network(next_states), dim=1, keepdim=True)
+            best_actions = torch.argmax(
+                self.q_network(next_states), dim=1, keepdim=True
+            )
             next_q_values = self.target_network(next_states).gather(1, best_actions)
         return rewards + (self.gamma * next_q_values * (1 - dones))
 

@@ -123,15 +123,15 @@ class SACAgent(BaseAgent):
             else target_entropy
         )
 
-        self.actor = DiscretePolicyNetwork(
-            state_size, action_size, hidden_size
-        ).to(self.device)
-        self.critic_1 = DiscreteQNetwork(
-            state_size, action_size, hidden_size
-        ).to(self.device)
-        self.critic_2 = DiscreteQNetwork(
-            state_size, action_size, hidden_size
-        ).to(self.device)
+        self.actor = DiscretePolicyNetwork(state_size, action_size, hidden_size).to(
+            self.device
+        )
+        self.critic_1 = DiscreteQNetwork(state_size, action_size, hidden_size).to(
+            self.device
+        )
+        self.critic_2 = DiscreteQNetwork(state_size, action_size, hidden_size).to(
+            self.device
+        )
         self.target_critic_1 = DiscreteQNetwork(
             state_size, action_size, hidden_size
         ).to(self.device)
@@ -233,9 +233,9 @@ class SACAgent(BaseAgent):
 
         probs, log_probs = self.actor.action_probs(states)
         min_q = torch.minimum(self.critic_1(states), self.critic_2(states))
-        actor_loss = (probs * (self.alpha.detach() * log_probs - min_q)).sum(
-            dim=1
-        ).mean()
+        actor_loss = (
+            (probs * (self.alpha.detach() * log_probs - min_q)).sum(dim=1).mean()
+        )
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()

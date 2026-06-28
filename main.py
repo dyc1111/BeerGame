@@ -48,7 +48,9 @@ def main(config: Any) -> None:
 
     if execution_mode == "ctde_multi_agent":
         if config["algo"]["name"] != "mappo":
-            raise ValueError("ctde_multi_agent execution_mode currently requires algo=mappo")
+            raise ValueError(
+                "ctde_multi_agent execution_mode currently requires algo=mappo"
+            )
         mappo = build_configured_mappo(config, device)
         print(
             "Training MAPPO CTDE learners for firms: "

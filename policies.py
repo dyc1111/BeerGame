@@ -31,11 +31,18 @@ class AgentObservationTransform:
     def __init__(self, config: Any, device: torch.device) -> None:
         self.enabled: bool = bool(config["train"].get("normalize_observations", True))
         env_config = config["env"]
+        order_scale = max(float(env_config["max_order"]), 1.0)
+        inventory_scale = max(
+            float(env_config["initial_inventory"]),
+            order_scale,
+            float(env_config["poisson_lambda"]),
+            1.0,
+        )
         self.scale = torch.tensor(
             [
-                max(float(env_config["max_order"]), 1.0),
-                max(float(env_config["max_order"]), 1.0),
-                max(float(env_config["initial_inventory"]), 1.0),
+                order_scale,
+                order_scale,
+                inventory_scale,
             ],
             dtype=torch.float32,
             device=device,
