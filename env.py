@@ -86,7 +86,10 @@ class Env:
         self.orders = actions.to(self.device)
         self.demand = self._generate_demand()
         self.satisfied_demand = torch.minimum(self.demand, self.inventory)
-        self.inventory += self.orders - self.satisfied_demand
+        inbound_shipments = torch.empty_like(self.orders)
+        inbound_shipments[:-1] = self.satisfied_demand[1:]
+        inbound_shipments[-1] = self.orders[-1]
+        self.inventory += inbound_shipments - self.satisfied_demand
         loss_sales = torch.clamp(self.demand - self.satisfied_demand, min=0.0)
         rewards = (
             self.p[:-1] * self.satisfied_demand

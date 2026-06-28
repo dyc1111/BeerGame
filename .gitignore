@@ -3,3 +3,4 @@ models
 figures
 *.log
 *.png
+.vscode

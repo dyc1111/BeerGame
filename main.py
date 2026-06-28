@@ -12,6 +12,7 @@ from experiment import (
     DEFAULT_DEVICE_NAME,
     build_configured_agent,
     build_configured_agents,
+    build_configured_mappo,
     build_env,
     build_output_dirs,
     select_device,
@@ -24,7 +25,14 @@ from plotting import (
     plot_training_results,
 )
 from policies import AgentObservationTransform, build_opponent_policy
-from training import test, test_independent_agents, train, train_independent_agents
+from training import (
+    test,
+    test_independent_agents,
+    test_mappo,
+    train,
+    train_independent_agents,
+    train_mappo,
+)
 
 
 @hydra.main(config_path="cfg", config_name="base", version_base=None)
@@ -37,6 +45,44 @@ def main(config: Any) -> None:
     opponent_policy = build_opponent_policy(config, device)
     obs_transform = AgentObservationTransform(config, device)
     execution_mode = config.get("execution_mode", "single_agent")
+
+    if execution_mode == "ctde_multi_agent":
+        if config["algo"]["name"] != "mappo":
+            raise ValueError("ctde_multi_agent execution_mode currently requires algo=mappo")
+        mappo = build_configured_mappo(config, device)
+        print(
+            "Training MAPPO CTDE learners for firms: "
+            + ", ".join(str(firm_id) for firm_id in mappo.firm_ids)
+        )
+        scores_by_firm = train_mappo(
+            env, mappo, opponent_policy, obs_transform, config["train"], model_dir
+        )
+
+        plt.rcParams["axes.unicode_minus"] = False
+        plot_multi_agent_training_results(
+            scores_by_firm, config["algo"]["name"], figure_dir
+        )
+
+        (
+            test_scores_by_firm,
+            _inventory_history,
+            orders_history,
+            _demand_history,
+            _satisfied_demand_history,
+        ) = test_mappo(
+            env,
+            mappo,
+            opponent_policy,
+            obs_transform,
+            num_episodes=config["test"]["num_episodes"],
+        )
+
+        plot_multi_agent_test_results(
+            test_scores_by_firm,
+            orders_history,
+            figure_dir,
+        )
+        return
 
     if execution_mode == "independent_multi_agent":
         agents = build_configured_agents(config, device)

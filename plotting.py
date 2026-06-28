@@ -97,7 +97,7 @@ def plot_multi_agent_training_results(
         linewidth=2.5,
         label="Mean",
     )
-    plt.title(f"{algo_name.upper()} Independent Learner Training Rewards")
+    plt.title(f"{algo_name.upper()} Multi-Agent Training Rewards")
     plt.xlabel("Episode")
     plt.ylabel("Reward")
     plt.legend(ncol=2)
