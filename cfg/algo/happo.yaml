@@ -1,0 +1,25 @@
+name: happo
+
+agent:
+  state_size: 3
+  action_size: 20
+  hidden_size: 128
+  critic_hidden_size: 256
+  gamma: 0.99
+  actor_lr: 0.0003
+  critic_lr: 0.001
+  rollout_steps: 1000
+  minibatch_size: 256
+  ppo_epochs: 6
+  clip_coef: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.02
+  gae_lambda: 0.95
+  max_grad_norm: 0.5
+  normalize_advantages: true
+  individual_reward_weight: 0.5
+  randomize_update_order: true
+  use_happo_factor: true
+  initial_orders: null
+  initial_order: null
+  initial_order_bias: 0.0

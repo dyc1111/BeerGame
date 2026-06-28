@@ -4,6 +4,7 @@ from typing import Any, TypeAlias
 
 from .base import BaseAgent
 from .dqn import DQNAgent, DoubleDQNAgent, DuelingDQNAgent
+from .happo import HAPPO
 from .mappo import MAPPO
 from .ppo import PPOAgent
 from .sac import SACAgent
@@ -28,4 +29,4 @@ def build_agent(name: str, **kwargs: Any) -> BaseAgent:
     return ALGORITHMS[name](**kwargs)
 
 
-__all__ = ["ALGORITHMS", "MAPPO", "build_agent"]
+__all__ = ["ALGORITHMS", "HAPPO", "MAPPO", "build_agent"]

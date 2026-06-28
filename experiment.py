@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 
 from algo import build_agent
 from algo.base import BaseAgent
+from algo.happo import HAPPO
 from algo.mappo import MAPPO
 from env import Env
 
@@ -93,6 +94,24 @@ def build_configured_mappo(config: Any, device: torch.device) -> MAPPO:
         "device": device,
     }
     return MAPPO(**agent_config)
+
+
+def build_configured_happo(config: Any, device: torch.device) -> HAPPO:
+    env_config = config["env"]
+    algo_config = config["algo"]
+    multi_agent_config = config.get("multi_agent", {})
+    firm_ids = multi_agent_config.get("firm_ids")
+    if firm_ids is None:
+        firm_ids = range(env_config["num_firms"])
+
+    agent_config = {
+        **OmegaConf.to_container(algo_config["agent"], resolve=True),
+        "num_firms": env_config["num_firms"],
+        "firm_ids": [int(firm_id) for firm_id in firm_ids],
+        "max_order": env_config["max_order"],
+        "device": device,
+    }
+    return HAPPO(**agent_config)
 
 
 def build_output_dirs(config: Any) -> tuple[Path, Path]:

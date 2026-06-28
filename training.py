@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from algo.base import ActionResult, BaseAgent, Transition
+from algo.happo import HAPPO
 from algo.mappo import MAPPO
 from env import Env
 from policies import AgentObservationTransform, OpponentPolicy
@@ -440,6 +441,125 @@ def train_mappo(
     return scores_by_firm
 
 
+def collect_happo_actions(
+    env: Env,
+    happo: HAPPO,
+    opponent_policy: OpponentPolicy,
+    state: torch.Tensor,
+    mode: str,
+    obs_transform: AgentObservationTransform,
+) -> tuple[torch.Tensor, dict[int, ActionResult]]:
+    actions = torch.zeros(env.num_firms, dtype=torch.float32, device=state.device)
+    action_results: dict[int, ActionResult] = {}
+
+    for firm_id in range(env.num_firms):
+        if happo.has_firm(firm_id):
+            action_result = happo.act(firm_id, obs_transform(state[firm_id]), mode=mode)
+            actions[firm_id] = action_result.env_action
+            action_results[firm_id] = action_result
+        else:
+            actions[firm_id] = opponent_policy.act(state[firm_id], firm_id)
+
+    return actions, action_results
+
+
+def train_happo(
+    env: Env,
+    happo: HAPPO,
+    opponent_policy: OpponentPolicy,
+    obs_transform: AgentObservationTransform,
+    train_config: Any,
+    model_dir: Path,
+) -> AgentScores:
+    """
+    Train HAPPO with heterogeneous actors and a shared centralized critic.
+    """
+    scores_by_firm: AgentScores = {firm_id: [] for firm_id in happo.firm_ids}
+    num_episodes = train_config.get("num_episodes", 1000)
+    max_t = train_config.get("max_t", env.max_steps)
+    log_every = train_config.get("log_every", 100)
+    checkpoint_every = train_config.get("checkpoint_every", 500)
+    reward_scale = float(train_config.get("reward_scale", 1.0))
+    os.makedirs(model_dir, exist_ok=True)
+    last_update_metrics: dict[str, float] = {}
+
+    for i_episode in range(1, num_episodes + 1):
+        state = env.reset()
+        episode_scores = {
+            firm_id: torch.tensor(0.0, device=env.device) for firm_id in happo.firm_ids
+        }
+
+        for _ in range(max_t):
+            global_obs = _global_observation(state, obs_transform)
+            actions, action_results = collect_happo_actions(
+                env,
+                happo,
+                opponent_policy,
+                state,
+                mode="train",
+                obs_transform=obs_transform,
+            )
+            next_state, rewards, done = env.step(actions)
+            next_global_obs = _global_observation(next_state, obs_transform)
+            mean_reward = rewards.mean()
+
+            for firm_id in happo.firm_ids:
+                action_result = action_results[firm_id]
+                if action_result.raw_action is None or action_result.log_prob is None:
+                    raise RuntimeError("HAPPO actions must include raw_action/log_prob")
+                mixed_reward = (
+                    happo.individual_reward_weight * rewards[firm_id]
+                    + (1.0 - happo.individual_reward_weight) * mean_reward
+                )
+                happo.observe(
+                    firm_id=firm_id,
+                    local_obs=obs_transform(state[firm_id]),
+                    global_obs=global_obs,
+                    action=action_result.raw_action,
+                    reward=mixed_reward * reward_scale,
+                    next_global_obs=next_global_obs,
+                    done=done,
+                    log_prob=action_result.log_prob,
+                )
+                episode_scores[firm_id] += rewards[firm_id]
+
+            if happo.ready_to_update():
+                last_update_metrics = happo.update()
+
+            state = next_state
+            if done:
+                break
+
+        for firm_id, score in episode_scores.items():
+            scores_by_firm[firm_id].append(score.detach().clone())
+
+        if i_episode % log_every == 0:
+            recent_means = [
+                torch.stack(scores[-log_every:]).mean()
+                for scores in scores_by_firm.values()
+                if scores
+            ]
+            mean_agent_score = torch.stack(recent_means).mean().item()
+            print(
+                f"Episode {i_episode}/{num_episodes} | "
+                f"Mean Agent Score: {mean_agent_score:.2f}"
+                f"{_format_metrics(last_update_metrics)}"
+            )
+
+        if i_episode % checkpoint_every == 0:
+            happo.save(
+                os.path.join(model_dir, f"{happo.algo_name}_episode_{i_episode}.pth")
+            )
+
+    if happo.has_rollout_data():
+        last_update_metrics = happo.update(force=True)
+        if last_update_metrics:
+            print("Final partial update" + _format_metrics(last_update_metrics))
+
+    happo.save(os.path.join(model_dir, f"{happo.algo_name}_final.pth"))
+    return scores_by_firm
+
+
 def test(
     env: Env,
     agent: BaseAgent,
@@ -647,6 +767,86 @@ def test_mappo(
                 break
 
         for firm_id in mappo.firm_ids:
+            scores_by_firm[firm_id].append(episode_scores[firm_id].detach().clone())
+            inventory_history[firm_id].append(episode_inventory[firm_id])
+            orders_history[firm_id].append(episode_orders[firm_id])
+            demand_history[firm_id].append(episode_demand[firm_id])
+            satisfied_demand_history[firm_id].append(episode_satisfied_demand[firm_id])
+
+        mean_score = torch.stack(list(episode_scores.values())).mean().item()
+        print(
+            f"Test Episode {i_episode}/{num_episodes} | "
+            f"Mean Agent Score: {mean_score:.2f}"
+        )
+
+    return (
+        scores_by_firm,
+        inventory_history,
+        orders_history,
+        demand_history,
+        satisfied_demand_history,
+    )
+
+
+def test_happo(
+    env: Env,
+    happo: HAPPO,
+    opponent_policy: OpponentPolicy,
+    obs_transform: AgentObservationTransform,
+    num_episodes: int = 10,
+) -> IndependentTestResult:
+    """
+    Evaluate HAPPO actors with decentralized execution.
+    """
+    scores_by_firm: AgentScores = {firm_id: [] for firm_id in happo.firm_ids}
+    inventory_history: AgentHistories = {firm_id: [] for firm_id in happo.firm_ids}
+    orders_history: AgentHistories = {firm_id: [] for firm_id in happo.firm_ids}
+    demand_history: AgentHistories = {firm_id: [] for firm_id in happo.firm_ids}
+    satisfied_demand_history: AgentHistories = {
+        firm_id: [] for firm_id in happo.firm_ids
+    }
+
+    for i_episode in range(1, num_episodes + 1):
+        state = env.reset()
+        episode_scores = {
+            firm_id: torch.tensor(0.0, device=env.device) for firm_id in happo.firm_ids
+        }
+        episode_inventory: AgentHistories = {firm_id: [] for firm_id in happo.firm_ids}
+        episode_orders: AgentHistories = {firm_id: [] for firm_id in happo.firm_ids}
+        episode_demand: AgentHistories = {firm_id: [] for firm_id in happo.firm_ids}
+        episode_satisfied_demand: AgentHistories = {
+            firm_id: [] for firm_id in happo.firm_ids
+        }
+
+        for _ in range(env.max_steps):
+            actions, _ = collect_happo_actions(
+                env,
+                happo,
+                opponent_policy,
+                state,
+                mode="eval",
+                obs_transform=obs_transform,
+            )
+            next_state, rewards, done = env.step(actions)
+
+            for firm_id in happo.firm_ids:
+                episode_inventory[firm_id].append(
+                    env.inventory[firm_id].detach().cpu().clone()
+                )
+                episode_orders[firm_id].append(actions[firm_id].detach().cpu().clone())
+                episode_demand[firm_id].append(
+                    env.demand[firm_id].detach().cpu().clone()
+                )
+                episode_satisfied_demand[firm_id].append(
+                    env.satisfied_demand[firm_id].detach().cpu().clone()
+                )
+                episode_scores[firm_id] += rewards[firm_id]
+
+            state = next_state
+            if done:
+                break
+
+        for firm_id in happo.firm_ids:
             scores_by_firm[firm_id].append(episode_scores[firm_id].detach().clone())
             inventory_history[firm_id].append(episode_inventory[firm_id])
             orders_history[firm_id].append(episode_orders[firm_id])

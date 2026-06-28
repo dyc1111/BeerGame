@@ -12,6 +12,7 @@ from experiment import (
     DEFAULT_DEVICE_NAME,
     build_configured_agent,
     build_configured_agents,
+    build_configured_happo,
     build_configured_mappo,
     build_env,
     build_output_dirs,
@@ -27,9 +28,11 @@ from plotting import (
 from policies import AgentObservationTransform, build_opponent_policy
 from training import (
     test,
+    test_happo,
     test_independent_agents,
     test_mappo,
     train,
+    train_happo,
     train_independent_agents,
     train_mappo,
 )
@@ -47,17 +50,24 @@ def main(config: Any) -> None:
     execution_mode = config.get("execution_mode", "single_agent")
 
     if execution_mode == "ctde_multi_agent":
-        if config["algo"]["name"] != "mappo":
+        algo_name = config["algo"]["name"]
+        if algo_name not in {"mappo", "happo"}:
             raise ValueError(
-                "ctde_multi_agent execution_mode currently requires algo=mappo"
+                "ctde_multi_agent execution_mode currently requires algo=mappo or algo=happo"
             )
-        mappo = build_configured_mappo(config, device)
-        print(
-            "Training MAPPO CTDE learners for firms: "
-            + ", ".join(str(firm_id) for firm_id in mappo.firm_ids)
+        learner = (
+            build_configured_happo(config, device)
+            if algo_name == "happo"
+            else build_configured_mappo(config, device)
         )
-        scores_by_firm = train_mappo(
-            env, mappo, opponent_policy, obs_transform, config["train"], model_dir
+        print(
+            f"Training {algo_name.upper()} CTDE learners for firms: "
+            + ", ".join(str(firm_id) for firm_id in learner.firm_ids)
+        )
+        train_fn = train_happo if algo_name == "happo" else train_mappo
+        test_fn = test_happo if algo_name == "happo" else test_mappo
+        scores_by_firm = train_fn(
+            env, learner, opponent_policy, obs_transform, config["train"], model_dir
         )
 
         plt.rcParams["axes.unicode_minus"] = False
@@ -71,9 +81,9 @@ def main(config: Any) -> None:
             orders_history,
             _demand_history,
             _satisfied_demand_history,
-        ) = test_mappo(
+        ) = test_fn(
             env,
-            mappo,
+            learner,
             opponent_policy,
             obs_transform,
             num_episodes=config["test"]["num_episodes"],
